@@ -13,11 +13,21 @@ Run:
     #   /Users/pixeli/dllm/examples/llada_looped/sft.py
 """
 
-from dllm.pipelines.llada.models.configuration_llada import LLaDAConfig
+from dllm.pipelines.llada.models.configuration_llada import LLaDAConfig, ModelConfig
 
 
 class LLaDALoopedConfig(LLaDAConfig):
     model_type = "llada_looped"
+
+    # ModelConfig defines this as a @property, not a dataclass field. LLaDAConfig
+    # inherits from PretrainedConfig (not ModelConfig), so the property doesn't
+    # come along. Vanilla LLaDA sidesteps this because LLaDAModelLM.__init__
+    # converts LLaDAConfig -> ModelConfig via create_model_config_from_pretrained_config
+    # before constructing LLaDAModel. We pass LLaDALoopedConfig straight through
+    # to LLaDAModel, so we need the property here directly.
+    @property
+    def effective_n_kv_heads(self) -> int:
+        return ModelConfig.effective_n_kv_heads.fget(self)
 
     def __init__(
         self,
