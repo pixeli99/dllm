@@ -70,11 +70,13 @@ class LoopArguments:
     recurrent_layers: int = 16
     coda_layers: int = 8
     mu_rec_eval: int = 2
-    use_input_norm: bool = True
+    # e = x_prelude verbatim (no LN) by default so μ_rec=1 is exactly vanilla.
+    use_input_norm: bool = False
     use_diag_B: bool = False
-    A_init_log: float = -4.0
+    # h_0 = 0 + B=I init => h_1 = R(x_prelude) = vanilla LLaDA forward.
+    A_init_log: float = 5.0
     delta_init: float = 1.0
-    B_init_scale: float = 0.0
+    B_init_identity: bool = True
 
 
 @dataclass
@@ -131,7 +133,7 @@ def train():
         use_diag_B=loop_args.use_diag_B,
         A_init_log=loop_args.A_init_log,
         delta_init=loop_args.delta_init,
-        B_init_scale=loop_args.B_init_scale,
+        B_init_identity=loop_args.B_init_identity,
     )
     model = LLaDALoopedModelLM.from_llada_checkpoint(
         model_args.model_name_or_path, **loop_kwargs

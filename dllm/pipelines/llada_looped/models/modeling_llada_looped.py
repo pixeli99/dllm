@@ -64,21 +64,30 @@ class LLaDALoopedModel(LLaDAModel):
         d = config.d_model
 
         # --- Parcae stabilizer params ---
+        # A_init_log = 5 -> A_disc = exp(-exp(5)) ≈ 0; with h_0 = 0 this is
+        # irrelevant at step 0, but keeps state decayed so new e inputs aren't
+        # blown up by a lingering large A·h feedback term in later steps.
         self.log_A = nn.Parameter(torch.full((d,), float(config.A_init_log)))
         self.delta = nn.Parameter(torch.full((d,), float(config.delta_init)))
+
+        # B_inject init = identity so B·e == e at step 0.
+        # Combined with h_0 = 0 and e = x_prelude, this gives
+        #     h_1 = R(0 + I·x_prelude) = R(x_prelude) = vanilla LLaDA forward.
         if config.use_diag_B:
-            self.B_inject = nn.Parameter(
-                torch.full((d,), float(config.B_init_scale))
-            )
-        else:
-            if config.B_init_scale == 0.0:
-                B_mat = torch.zeros(d, d)
+            if config.B_init_identity:
+                self.B_inject = nn.Parameter(torch.ones(d))
             else:
-                # Small random init scaled by B_init_scale / sqrt(d)
-                B_mat = torch.randn(d, d) * (config.B_init_scale / math.sqrt(d))
-            self.B_inject = nn.Parameter(B_mat)
+                self.B_inject = nn.Parameter(torch.zeros(d))
+        else:
+            if config.B_init_identity:
+                self.B_inject = nn.Parameter(torch.eye(d))
+            else:
+                self.B_inject = nn.Parameter(torch.zeros(d, d))
 
         # --- Input-injection normalization (LN of prelude output) ---
+        # Default off: e = x_prelude verbatim. Turning this on inserts an
+        # extra learnable LN between the prelude and the loop; useful if
+        # prelude-output magnitudes drift but breaks the drop-in retrofit.
         if config.use_input_norm:
             self.input_norm = LayerNorm.build(config)
         else:
@@ -189,11 +198,16 @@ class LLaDALoopedModel(LLaDAModel):
             x, _ = block(x, attention_bias=eff_bias, layer_past=None, use_cache=False)
 
         # --- Input injection signal (computed once, reused each recurrence) ---
+        # input_norm defaults to nn.Identity() so e == x_prelude, matching
+        # the activation distribution that blocks[prelude:coda] saw in
+        # LLaDA-8B pretraining.
         e = self.input_norm(x)
 
         # --- Recurrent loop ---
+        # SSM state starts at 0; driven entirely by B·e at step 0. Combined
+        # with B = I init, this makes h_1 = R(e) = R(x_prelude) exactly.
         A_disc, B_disc = self._discrete_AB()
-        h = x
+        h = torch.zeros_like(x)
         n_no_grad = T_rec - T_bwd
         for r in range(T_rec):
             ctx = torch.no_grad() if r < n_no_grad else nullcontext()
@@ -249,6 +263,9 @@ class LLaDALoopedModelLM(LLaDAModelLM):
         # Skip LLaDAModelLM.__init__ to avoid constructing a throwaway LLaDAModel.
         LLaDAPreTrainedModel.__init__(self, config)
         if model is None:
+            # Mirror vanilla LLaDAModelLM: allocate params directly on GPU so
+            # we don't hold an 8B-param CPU-resident copy before FSDP shards.
+            config.init_device = "cuda"
             self.model = LLaDALoopedModel(config, init_params=init_params)
         else:
             self.model = model

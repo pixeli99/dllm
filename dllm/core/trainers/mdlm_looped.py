@@ -234,10 +234,12 @@ class MDLMLoopedTrainer(MDLMTrainer):
                     T_bwd=0,
                 )
             ref_logits = ref_outputs.logits.detach()
-            # Restrict to maskable positions to keep the target informative.
-            mm = masked_mask.to(dtype=logits.dtype).unsqueeze(-1)
+            # Promote to float32 for the diff^2 sum — logits are [B, L, ~126k]
+            # bf16, and a bf16 squared diff can overflow / underflow easily.
+            mm = masked_mask.to(dtype=torch.float32).unsqueeze(-1)
             denom = mm.sum().clamp_min(1.0)
-            cycle_loss = ((logits - ref_logits).pow(2) * mm).sum() / denom
+            diff = logits.float() - ref_logits.float()
+            cycle_loss = (diff.pow(2) * mm).sum() / denom
             total_loss = total_loss + self.cycle_consistency_weight * cycle_loss
 
         return (total_loss, outputs) if return_outputs else total_loss
