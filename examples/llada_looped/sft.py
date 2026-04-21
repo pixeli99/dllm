@@ -79,7 +79,9 @@ class LoopArguments:
 
 @dataclass
 class DataArguments(dllm.utils.DataArguments):
-    dataset_args: str = "allenai/tulu-3-sft-mixture[train:10000,test:1000]"
+    # OpenMathInstruct-2: 14M math problems with step-by-step solutions ending
+    # in \\boxed{answer}. Default slice: 500k train + 5k test for first runs.
+    dataset_args: str = "nvidia/OpenMathInstruct-2[train:500000,test:5000]"
     load_preprocessed_data: bool = False
     mask_prompt_loss: bool = field(
         default=True,
@@ -89,7 +91,7 @@ class DataArguments(dllm.utils.DataArguments):
 
 @dataclass
 class TrainingArguments(dllm.core.trainers.MDLMLoopedConfig):
-    output_dir: str = ".models/LLaDA-8B-Looped/tulu-3-mu2"
+    output_dir: str = ".models/LLaDA-8B-Looped/openmath2-mu2"
     group_by_length: bool = True
     num_train_epochs: float = 3
     learning_rate: float = 2e-5
