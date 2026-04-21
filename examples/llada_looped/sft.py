@@ -115,7 +115,8 @@ def train():
         data_args,
         training_args,
     ) = parser.parse_args_into_dataclasses()
-    dllm.utils.print_args_main(model_args, loop_args, data_args, training_args)
+    dllm.utils.print_args_main(model_args, data_args, training_args)
+    dllm.utils.print_args(loop_args)
     dllm.utils.initial_training_setup(model_args, data_args, training_args)
 
     # Model: retrofit LLaDA-8B into a looped variant with drop-in weight load.
