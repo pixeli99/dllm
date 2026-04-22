@@ -105,6 +105,15 @@ class MDLMLoopedTrainer(MDLMTrainer):
         if bool(args.freeze_base):
             self._apply_base_freeze(True)
 
+        # Running stats reset at each log emit (see `log`).
+        self._loop_running = {
+            "t_rec_sum": 0.0,
+            "t_bwd_sum": 0.0,
+            "cc_loss_sum": 0.0,
+            "cc_count": 0,
+            "n": 0,
+        }
+
     # ---- Freeze/unfreeze base model ----
     def _apply_base_freeze(self, freeze: bool) -> None:
         """Freeze all params except the loop controller when `freeze=True`."""
@@ -225,6 +234,8 @@ class MDLMLoopedTrainer(MDLMTrainer):
         total_loss = main_loss
 
         # --- Cycle-consistency: pull logits(T_rec) toward detached logits(T_rec+1) ---
+        cc_loss_val = 0.0
+        did_cc = False
         if self.cycle_consistency_weight > 0.0 and T_rec < self.mu_rec_train_max:
             with torch.no_grad():
                 ref_outputs = model(
@@ -241,5 +252,103 @@ class MDLMLoopedTrainer(MDLMTrainer):
             diff = logits.float() - ref_logits.float()
             cycle_loss = (diff.pow(2) * mm).sum() / denom
             total_loss = total_loss + self.cycle_consistency_weight * cycle_loss
+            cc_loss_val = float(cycle_loss.detach().item())
+            did_cc = True
+
+        # --- Accumulate running stats for `log()` emit ---
+        if model.training:
+            self._loop_running["t_rec_sum"] += float(T_rec)
+            self._loop_running["t_bwd_sum"] += float(T_bwd)
+            self._loop_running["n"] += 1
+            if did_cc:
+                self._loop_running["cc_loss_sum"] += cc_loss_val
+                self._loop_running["cc_count"] += 1
 
         return (total_loss, outputs) if return_outputs else total_loss
+
+    # ---- Log injection -------------------------------------------------------
+    def log(self, logs: dict, start_time=None) -> None:  # type: ignore[override]
+        """Inject loop-specific metrics into every trainer log emit."""
+        # Running averages over the interval since the previous log.
+        n = max(1, self._loop_running["n"])
+        logs["loop/T_rec_avg"] = self._loop_running["t_rec_sum"] / n
+        logs["loop/T_bwd_avg"] = self._loop_running["t_bwd_sum"] / n
+        if self._loop_running["cc_count"] > 0:
+            logs["loop/cc_loss_avg"] = (
+                self._loop_running["cc_loss_sum"] / self._loop_running["cc_count"]
+            )
+        # Reset running counters.
+        for k in self._loop_running:
+            self._loop_running[k] = 0 if k.endswith("count") or k == "n" else 0.0
+
+        # Static snapshots of loop params (FSDP-safe, each rank contributes its shard).
+        logs.update(self._loop_param_snapshot())
+
+        # Forward to base Trainer.log (handles TB/wandb emit).
+        try:
+            super().log(logs, start_time=start_time)
+        except TypeError:
+            # Older HF versions (pre-4.46) don't take start_time.
+            super().log(logs)
+
+    # ---- Snapshot helpers ----------------------------------------------------
+    @staticmethod
+    def _reduce_stats(local: torch.Tensor) -> dict:
+        """Global mean / std / absmax of `local` (a shard or full tensor).
+        Uses all_reduce when torch.distributed is initialized; otherwise uses
+        the local values directly."""
+        local = local.detach().float()
+        n = torch.tensor(float(local.numel()), device=local.device)
+        s = local.sum()
+        s2 = local.pow(2).sum()
+        mx = local.abs().max() if local.numel() > 0 else torch.tensor(
+            0.0, device=local.device
+        )
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            pack = torch.stack([s, s2, n])
+            torch.distributed.all_reduce(pack, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(mx, op=torch.distributed.ReduceOp.MAX)
+            s_, s2_, n_ = pack[0].item(), pack[1].item(), pack[2].item()
+            mx_ = mx.item()
+        else:
+            s_, s2_, n_, mx_ = s.item(), s2.item(), n.item(), mx.item()
+        n_ = max(n_, 1.0)
+        mean = s_ / n_
+        var = max(0.0, s2_ / n_ - mean * mean)
+        return {"mean": mean, "std": var ** 0.5, "absmax": mx_}
+
+    def _loop_param_snapshot(self) -> dict:
+        """Per-param + derived stats for log_A, delta, B_inject, plus gradient
+        norms. Safe under FSDP with fsdp_use_orig_params=True."""
+        out: dict = {}
+        target_short = {"log_A", "delta", "B_inject"}
+        for name, p in self.model.named_parameters():
+            short = name.rsplit(".", 1)[-1]
+            if short not in target_short:
+                continue
+            stats = self._reduce_stats(p.data)
+            out[f"loop/{short}_mean"] = stats["mean"]
+            out[f"loop/{short}_std"] = stats["std"]
+            out[f"loop/{short}_absmax"] = stats["absmax"]
+            # Gradient norm (if populated).
+            if p.grad is not None:
+                g = p.grad.detach().float()
+                g_sq = g.pow(2).sum()
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(
+                        g_sq, op=torch.distributed.ReduceOp.SUM
+                    )
+                out[f"loop/grad_{short}_norm"] = g_sq.item() ** 0.5
+
+        # Cheap scalar proxy for A_disc, computed from the global means of
+        # log_A and delta. Not identical to element-wise mean(A_disc), but
+        # tracks the same trend and avoids an extra all_gather of the full
+        # parameter vector on each log step.
+        if "loop/log_A_mean" in out and "loop/delta_mean" in out:
+            try:
+                a_cont = -math.exp(out["loop/log_A_mean"])
+                out["loop/A_disc_proxy"] = math.exp(out["loop/delta_mean"] * a_cont)
+            except (OverflowError, ValueError):
+                pass
+
+        return out

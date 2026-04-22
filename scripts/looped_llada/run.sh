@@ -13,6 +13,8 @@ accelerate launch \
   --per_device_train_batch_size 2 \
   --max_length 1024 \
   --learning_rate 2e-5 \
+  --report_to tensorboard \
+  --logging_dir .models/loop/full-openmath2-500k/tb \
   --recurrence_dist poisson \
   --mu_rec_train_mean 2 --mu_rec_train_max 4 \
   --t_adaptive True \
