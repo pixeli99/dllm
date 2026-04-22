@@ -53,45 +53,7 @@ from dllm.pipelines.llada.models.modeling_llada import (
 
 from .configuration_llada_looped import LLaDALoopedConfig
 
-
-# ----- First-N-forwards numerical diagnostic -----
-# Prints min / max / absmax / mean of each stage's tensor on rank 0 for the
-# first few forward passes, and raises immediately when a non-finite value
-# appears. Set DLLM_LOOP_DIAG_STEPS=0 to disable, or =10 for longer trace.
 import os as _os
-
-_DIAG_MAX = int(_os.environ.get("DLLM_LOOP_DIAG_STEPS", "3"))
-_DIAG_COUNTER = {"n": 0}
-
-
-def _is_main_rank() -> bool:
-    return _os.environ.get("LOCAL_RANK", "0") == "0"
-
-
-def _diag(t: torch.Tensor, tag: str) -> None:
-    has_nan = bool(torch.isnan(t).any().item())
-    has_inf = bool(torch.isinf(t).any().item())
-    if has_nan or has_inf:
-        n_nan = int(torch.isnan(t).sum().item())
-        n_inf = int(torch.isinf(t).sum().item())
-        raise RuntimeError(
-            f"[loop-diag] NON-FINITE at '{tag}': "
-            f"shape={tuple(t.shape)} dtype={t.dtype} "
-            f"nan={n_nan} inf={n_inf}"
-        )
-    if _DIAG_COUNTER["n"] >= _DIAG_MAX or not _is_main_rank():
-        return
-    tf = t.detach().float()
-    print(
-        f"[loop-diag step={_DIAG_COUNTER['n']}] {tag}: "
-        f"shape={tuple(t.shape)} dtype={t.dtype} "
-        f"min={tf.min().item():+.3e} "
-        f"max={tf.max().item():+.3e} "
-        f"absmax={tf.abs().max().item():.3e} "
-        f"mean={tf.mean().item():+.3e} "
-        f"std={tf.std().item():.3e}",
-        flush=True,
-    )
 
 
 class LLaDALoopedModel(LLaDAModel):
@@ -206,7 +168,6 @@ class LLaDALoopedModel(LLaDAModel):
         if self.config.input_emb_norm:
             x = x * (self.config.d_model ** 0.5)
         x = self.transformer.emb_drop(x)
-        _diag(x, "0_after_embed")
 
         # --- Attention bias (bidirectional for MDM + masked padding) ---
         if attention_mask is not None and 0.0 in attention_mask:
@@ -242,32 +203,22 @@ class LLaDALoopedModel(LLaDAModel):
             if output_hidden_states:
                 all_hidden_states.append(x)
             x, _ = block(x, attention_bias=eff_bias, layer_past=None, use_cache=False)
-        _diag(x, f"1_after_prelude[{prelude_end}]")
 
         # --- Input injection signal (computed once, reused each recurrence) ---
         e = self.input_norm(x)
-        _diag(e, "2_e=input_norm(x)")
 
         # --- Recurrent loop ---
         A_disc, B_disc = self._discrete_AB()
-        _diag(A_disc, "3_A_disc")
-        _diag(B_disc, "3_B_disc")
-
         h = torch.zeros_like(x)
-        _diag(h, "4_h_init=zeros")
-
         n_no_grad = T_rec - T_bwd
         for r in range(T_rec):
             ctx = torch.no_grad() if r < n_no_grad else nullcontext()
             with ctx:
                 h_in = self._inject(h, e, A_disc, B_disc)
-                _diag(h_in, f"5_loop[r={r}]/after_inject")
-                for bi, block in enumerate(blocks[prelude_end:coda_start]):
+                for block in blocks[prelude_end:coda_start]:
                     h_in, _ = block(
                         h_in, attention_bias=eff_bias, layer_past=None, use_cache=False
                     )
-                    if bi in (0, len(blocks[prelude_end:coda_start]) - 1):
-                        _diag(h_in, f"6_loop[r={r}]/block[{bi}]")
                 h = h_in
 
         # --- Coda ---
@@ -276,7 +227,6 @@ class LLaDALoopedModel(LLaDAModel):
             if output_hidden_states:
                 all_hidden_states.append(x)
             x, _ = block(x, attention_bias=eff_bias, layer_past=None, use_cache=False)
-        _diag(x, "7_after_coda")
 
         if last_logits_only:
             x = x[:, -1, :].unsqueeze(1)
@@ -291,8 +241,6 @@ class LLaDALoopedModel(LLaDAModel):
             logits = self.transformer.ff_out(x)
         if self.config.scale_logits:
             logits = logits * (1.0 / math.sqrt(self.config.d_model))
-        _diag(logits, "8_logits")
-        _DIAG_COUNTER["n"] += 1
 
         return LLaDAOutput(
             logits=logits,

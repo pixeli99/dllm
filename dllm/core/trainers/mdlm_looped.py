@@ -82,38 +82,6 @@ def _is_loop_param_name(name: str) -> bool:
     return any(name == p or name.startswith(p) for p in _LOOP_PARAM_PREFIXES)
 
 
-# ----- Loss-path diagnostic (matches modeling_llada_looped._diag) -----
-import os as _os
-
-_TRAINER_DIAG_MAX = int(_os.environ.get("DLLM_LOOP_DIAG_STEPS", "3"))
-_TRAINER_DIAG_COUNTER = {"n": 0}
-
-
-def _diag_loss(t: torch.Tensor, tag: str) -> None:
-    has_nan = bool(torch.isnan(t).any().item())
-    has_inf = bool(torch.isinf(t).any().item())
-    if has_nan or has_inf:
-        raise RuntimeError(
-            f"[loss-diag] NON-FINITE at '{tag}': "
-            f"shape={tuple(t.shape)} dtype={t.dtype} "
-            f"nan={int(torch.isnan(t).sum().item())} "
-            f"inf={int(torch.isinf(t).sum().item())}"
-        )
-    if _TRAINER_DIAG_COUNTER["n"] >= _TRAINER_DIAG_MAX:
-        return
-    if _os.environ.get("LOCAL_RANK", "0") != "0":
-        return
-    tf = t.detach().float()
-    print(
-        f"[loss-diag step={_TRAINER_DIAG_COUNTER['n']}] {tag}: "
-        f"shape={tuple(t.shape)} dtype={t.dtype} "
-        f"min={tf.min().item():+.3e} "
-        f"max={tf.max().item():+.3e} "
-        f"mean={tf.mean().item():+.3e}",
-        flush=True,
-    )
-
-
 class MDLMLoopedTrainer(MDLMTrainer):
 
     def __init__(self, args: MDLMLoopedConfig, *pargs, **kwargs):
@@ -222,23 +190,6 @@ class MDLMLoopedTrainer(MDLMTrainer):
         )
         outputs = self._postprocess_outputs(outputs)
         logits = outputs.logits
-        _diag_loss(logits, "A_logits_from_model")
-
-        # Step-level summary (rank 0, first few steps only).
-        if (
-            _TRAINER_DIAG_COUNTER["n"] < _TRAINER_DIAG_MAX
-            and _os.environ.get("LOCAL_RANK", "0") == "0"
-        ):
-            n_mask = int(masked_mask.sum().item())
-            n_maskable = int(maskable_mask.sum().item())
-            print(
-                f"[loss-diag step={_TRAINER_DIAG_COUNTER['n']}] "
-                f"T_rec={T_rec} T_bwd={T_bwd} "
-                f"p_mask.mean={p_mask.mean().item():.3f} "
-                f"masked_tokens={n_mask} maskable_tokens={n_maskable} "
-                f"t.mean={t.mean().item():.3f}",
-                flush=True,
-            )
 
         # --- MDLM token-level CE on masked positions ---
         loss_weights = self._compute_loss_weights(
@@ -251,9 +202,7 @@ class MDLMLoopedTrainer(MDLMTrainer):
         token_nll = F.cross_entropy(
             logits.transpose(1, 2), input_ids, reduction="none"
         )
-        _diag_loss(token_nll, "B_token_nll_raw")
         token_nll = token_nll * loss_weights * masked_mask.to(token_nll.dtype)
-        _diag_loss(token_nll, "C_token_nll_masked")
 
         self.meter.update(
             split="train" if model.training else "eval",
@@ -272,8 +221,6 @@ class MDLMLoopedTrainer(MDLMTrainer):
         else:
             raise ValueError(f"Invalid loss_norm_type: {self.loss_norm_type}")
         main_loss = token_nll.sum()
-        _diag_loss(main_loss, "D_main_loss")
-        _TRAINER_DIAG_COUNTER["n"] += 1
 
         total_loss = main_loss
 
