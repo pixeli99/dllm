@@ -24,13 +24,12 @@ Run:
         /Users/pixeli/dllm/examples/llada_looped/sft.py \
         --output_dir .models/LLaDA-8B-Looped/tulu-3-mu2-poisson
 
-    # t-adaptive schedule + cycle-consistency ablation:
+    # t-adaptive schedule:
     accelerate launch \
         --config_file /Users/pixeli/dllm/scripts/accelerate_configs/fsdp.yaml \
         /Users/pixeli/dllm/examples/llada_looped/sft.py \
-        --output_dir .models/LLaDA-8B-Looped/tulu-3-t_adapt-cc \
-        --t_adaptive True --t_bump_center 0.5 --t_bump_width 0.25 \
-        --cycle_consistency_weight 0.1
+        --output_dir .models/LLaDA-8B-Looped/tulu-3-t_adapt \
+        --t_adaptive True --t_bump_center 0.5 --t_bump_width 0.25
 
     # Stage-1 warm-start (freeze base, train only loop controller):
     accelerate launch \

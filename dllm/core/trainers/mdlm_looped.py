@@ -17,13 +17,7 @@ Extends MDLMTrainer with:
    iterations propagate gradient; earlier ones run under `torch.no_grad()`
    inside the model.
 
-4. Cycle-consistency regularizer. When
-   `cycle_consistency_weight > 0`, a second forward at `T_rec + 1`
-   (under `no_grad`) produces a target the main forward is pulled
-   toward. This encourages the loop to converge to a fixed point so
-   test-time `T_rec` can extrapolate beyond training.
-
-5. Warm-start freeze. When `freeze_base=True`, only the loop-controller
+4. Warm-start freeze. When `freeze_base=True`, only the loop-controller
    parameters (`log_A`, `delta`, `B_inject`, `input_norm.*`) are
    trainable. Intended for stage-1 runs before a full unfreeze resume.
 
@@ -63,9 +57,6 @@ class MDLMLoopedConfig(MDLMConfig):
     # ---- Truncated BPTT ----
     mu_bwd_ratio: float = 0.5
 
-    # ---- Cycle-consistency reg ----
-    cycle_consistency_weight: float = 0.0
-
     # ---- Warm-start freeze ----
     freeze_base: bool = False
 
@@ -95,7 +86,6 @@ class MDLMLoopedTrainer(MDLMTrainer):
         self.t_bump_width = float(args.t_bump_width)
         self.t_bump_scale = float(args.t_bump_scale)
         self.mu_bwd_ratio = float(args.mu_bwd_ratio)
-        self.cycle_consistency_weight = float(args.cycle_consistency_weight)
 
         assert self.mu_rec_train_min >= 1
         assert self.mu_rec_train_max >= self.mu_rec_train_min
@@ -109,8 +99,6 @@ class MDLMLoopedTrainer(MDLMTrainer):
         self._loop_running = {
             "t_rec_sum": 0.0,
             "t_bwd_sum": 0.0,
-            "cc_loss_sum": 0.0,
-            "cc_count": 0,
             "n": 0,
         }
 
@@ -231,40 +219,13 @@ class MDLMLoopedTrainer(MDLMTrainer):
             raise ValueError(f"Invalid loss_norm_type: {self.loss_norm_type}")
         main_loss = token_nll.sum()
 
-        total_loss = main_loss
-
-        # --- Cycle-consistency: pull logits(T_rec) toward detached logits(T_rec+1) ---
-        cc_loss_val = 0.0
-        did_cc = False
-        if self.cycle_consistency_weight > 0.0 and T_rec < self.mu_rec_train_max:
-            with torch.no_grad():
-                ref_outputs = model(
-                    input_ids=noised_input_ids,
-                    attention_mask=attention_mask,
-                    T_rec=T_rec + 1,
-                    T_bwd=0,
-                )
-            ref_logits = ref_outputs.logits.detach()
-            # Promote to float32 for the diff^2 sum — logits are [B, L, ~126k]
-            # bf16, and a bf16 squared diff can overflow / underflow easily.
-            mm = masked_mask.to(dtype=torch.float32).unsqueeze(-1)
-            denom = mm.sum().clamp_min(1.0)
-            diff = logits.float() - ref_logits.float()
-            cycle_loss = (diff.pow(2) * mm).sum() / denom
-            total_loss = total_loss + self.cycle_consistency_weight * cycle_loss
-            cc_loss_val = float(cycle_loss.detach().item())
-            did_cc = True
-
         # --- Accumulate running stats for `log()` emit ---
         if model.training:
             self._loop_running["t_rec_sum"] += float(T_rec)
             self._loop_running["t_bwd_sum"] += float(T_bwd)
             self._loop_running["n"] += 1
-            if did_cc:
-                self._loop_running["cc_loss_sum"] += cc_loss_val
-                self._loop_running["cc_count"] += 1
 
-        return (total_loss, outputs) if return_outputs else total_loss
+        return (main_loss, outputs) if return_outputs else main_loss
 
     # ---- Log injection -------------------------------------------------------
     def log(self, logs: dict, start_time=None) -> None:  # type: ignore[override]
@@ -273,13 +234,9 @@ class MDLMLoopedTrainer(MDLMTrainer):
         n = max(1, self._loop_running["n"])
         logs["loop/T_rec_avg"] = self._loop_running["t_rec_sum"] / n
         logs["loop/T_bwd_avg"] = self._loop_running["t_bwd_sum"] / n
-        if self._loop_running["cc_count"] > 0:
-            logs["loop/cc_loss_avg"] = (
-                self._loop_running["cc_loss_sum"] / self._loop_running["cc_count"]
-            )
         # Reset running counters.
         for k in self._loop_running:
-            self._loop_running[k] = 0 if k.endswith("count") or k == "n" else 0.0
+            self._loop_running[k] = 0 if k == "n" else 0.0
 
         # Static snapshots of loop params (FSDP-safe, each rank contributes its shard).
         logs.update(self._loop_param_snapshot())
