@@ -405,4 +405,58 @@ class LLaDALoopedModelLM(LLaDAModelLM):
         merged.pop("model_type", None)
         merged.pop("architectures", None)
         looped_cfg = cls.config_class(**merged)
-        return cls.from_pretrained(pretrained_path, config=looped_cfg)
+
+        model = cls.from_pretrained(pretrained_path, config=looped_cfg)
+        # from_pretrained under FSDP uses low_cpu_mem_usage=True, which realizes
+        # missing-key parameters as zeros instead of running our __init__ code.
+        # Re-seed the loop params here (rank 0 only under cpu_ram_efficient_loading;
+        # FSDP sync_module_states=true will broadcast to the rest).
+        cls._reset_loop_parameters(model, looped_cfg)
+        return model
+
+    @staticmethod
+    def _reset_loop_parameters(model: "LLaDALoopedModelLM", config: LLaDALoopedConfig) -> None:
+        """Fill log_A / delta / B_inject (and input_norm if used) with their
+        intended init values. Safe to call after from_pretrained; idempotent."""
+        core = model.model  # LLaDALoopedModel
+        is_main = _os.environ.get("LOCAL_RANK", "0") == "0"
+
+        def _fill(p: torch.Tensor, v: float) -> None:
+            if p.device.type == "meta":
+                return  # Non-rank-0 under cpu_ram_efficient_loading; FSDP broadcasts later.
+            with torch.no_grad():
+                p.fill_(v)
+
+        if is_main:
+            print(
+                f"[loop-init] resetting loop params: "
+                f"log_A={config.A_init_log} delta={config.delta_init} "
+                f"B_init_identity={config.B_init_identity} "
+                f"use_diag_B={config.use_diag_B} "
+                f"use_input_norm={config.use_input_norm}",
+                flush=True,
+            )
+
+        _fill(core.log_A, float(config.A_init_log))
+        _fill(core.delta, float(config.delta_init))
+
+        B = core.B_inject
+        if B.device.type != "meta":
+            with torch.no_grad():
+                if config.use_diag_B:
+                    B.fill_(1.0 if config.B_init_identity else 0.0)
+                else:
+                    B.zero_()
+                    if config.B_init_identity:
+                        B.fill_diagonal_(1.0)
+
+        # input_norm's LayerNorm weight/bias also get realized as zeros; restore
+        # weight=1, bias=0 so the LN acts as a proper (γ=1, β=0) normalizer.
+        if config.use_input_norm and not isinstance(core.input_norm, nn.Identity):
+            ln = core.input_norm
+            w = getattr(ln, "weight", None)
+            b = getattr(ln, "bias", None)
+            if w is not None:
+                _fill(w, 1.0)
+            if b is not None:
+                _fill(b, 0.0)
