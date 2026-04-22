@@ -63,6 +63,19 @@ class LLaDALoopedModel(LLaDAModel):
 
     def __init__(self, config: LLaDALoopedConfig, init_params: bool = True):
         super().__init__(config, init_params=init_params)
+
+        # Validate the layer partition here (not in config.__init__; see note
+        # in configuration_llada_looped.py).
+        total = int(config.prelude_layers) + int(config.recurrent_layers) + int(
+            config.coda_layers
+        )
+        assert total <= config.n_layers, (
+            f"prelude ({config.prelude_layers}) + recurrent "
+            f"({config.recurrent_layers}) + coda ({config.coda_layers}) = "
+            f"{total} exceeds n_layers ({config.n_layers})."
+        )
+        assert int(config.recurrent_layers) >= 1, "recurrent_layers must be >= 1."
+
         d = config.d_model
         dev = config.init_device  # e.g. "cuda" — set by LLaDALoopedModelLM.__init__
 

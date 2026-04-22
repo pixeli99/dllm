@@ -59,12 +59,11 @@ class LLaDALoopedConfig(LLaDAConfig):
         kwargs.setdefault("architectures", ["LLaDALoopedModelLM"])
         super().__init__(**kwargs)
 
-        total = prelude_layers + recurrent_layers + coda_layers
-        assert total <= self.n_layers, (
-            f"prelude ({prelude_layers}) + recurrent ({recurrent_layers}) + "
-            f"coda ({coda_layers}) = {total} exceeds n_layers ({self.n_layers})."
-        )
-        assert recurrent_layers >= 1, "recurrent_layers must be >= 1."
+        # NB: Validity of (prelude + recurrent + coda) vs n_layers is checked
+        # in LLaDALoopedModel.__init__, not here. Reason: HF's to_diff_dict
+        # does `self.__class__()` (no kwargs) during JSON serialization, which
+        # falls back to ModelConfig's GPT-2-scale defaults (n_layers=12) and
+        # would otherwise crash the TensorBoard/WandB callbacks at train start.
 
         self.prelude_layers = prelude_layers
         self.recurrent_layers = recurrent_layers
