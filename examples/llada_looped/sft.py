@@ -74,7 +74,9 @@ class LoopArguments:
     use_input_norm: bool = False
     use_diag_B: bool = False
     # h_0 = 0 + B=I init => h_1 = R(x_prelude) = vanilla LLaDA forward.
-    A_init_log: float = 5.0
+    # A_init_log=0 => A_disc = exp(-1) ≈ 0.368 (not 0) so log_A has gradient
+    # signal from step 1; μ_rec=1 is still exactly vanilla thanks to h_0 = 0.
+    A_init_log: float = 0.0
     delta_init: float = 1.0
     B_init_identity: bool = True
 

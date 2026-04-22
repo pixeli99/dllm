@@ -47,10 +47,13 @@ class LLaDALoopedConfig(LLaDAConfig):
         use_input_norm: bool = False,
         # Diagonal vs full B_inject matrix.
         use_diag_B: bool = False,
-        # log_A = 5 -> A_cont = -exp(5) = -148, A_disc = exp(-148) ≈ 0.
-        # With h_0 = 0, A_disc ⊙ h_0 = 0 regardless, so init value of A
-        # only matters once h starts taking non-zero values across iterations.
-        A_init_log: float = 5.0,
+        # log_A = 0 -> A_cont = -1, A_disc = exp(-1) ≈ 0.368.
+        # With h_0 = 0, μ_rec=1 is still exactly vanilla LLaDA (A·0 = 0).
+        # Starting at A_disc ≈ 0 would dead-init the gradient: ∂A_disc/∂log_A
+        # is ~ exp(-exp(log_A)) which vanishes for log_A ≥ 5. Starting at
+        # A_disc ≈ 0.368 gives log_A real gradient signal from step 1 and
+        # immediately activates state feedback for μ_rec ≥ 2.
+        A_init_log: float = 0.0,
         delta_init: float = 1.0,
         # Identity init for B so B·e == e at step 0: μ_rec=1 is drop-in.
         B_init_identity: bool = True,
