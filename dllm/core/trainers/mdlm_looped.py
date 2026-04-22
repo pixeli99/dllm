@@ -44,7 +44,7 @@ from dllm.core.trainers.mdlm import MDLMConfig, MDLMTrainer
 class MDLMLoopedConfig(MDLMConfig):
     # ---- Recurrence sampling ----
     mu_rec_train_mean: float = 2.0
-    mu_rec_train_min: int = 1
+    mu_rec_train_min: int = 2
     mu_rec_train_max: int = 4
     recurrence_dist: str = "poisson"  # "poisson" | "uniform" | "fixed"
 
@@ -54,8 +54,11 @@ class MDLMLoopedConfig(MDLMConfig):
     t_bump_width: float = 0.25
     t_bump_scale: float = 1.0
 
-    # ---- Truncated BPTT ----
-    mu_bwd_ratio: float = 0.5
+    # ---- Truncated BPTT (1.0 = full BPTT through every iteration) ----
+    mu_bwd_ratio: float = 1.0
+
+    # ---- LR multiplier for loop-controller params (Mamba convention) ----
+    loop_lr_mult: float = 10.0
 
     # ---- Warm-start freeze ----
     freeze_base: bool = False
@@ -86,6 +89,7 @@ class MDLMLoopedTrainer(MDLMTrainer):
         self.t_bump_width = float(args.t_bump_width)
         self.t_bump_scale = float(args.t_bump_scale)
         self.mu_bwd_ratio = float(args.mu_bwd_ratio)
+        self.loop_lr_mult = float(args.loop_lr_mult)
 
         assert self.mu_rec_train_min >= 1
         assert self.mu_rec_train_max >= self.mu_rec_train_min
@@ -101,6 +105,57 @@ class MDLMLoopedTrainer(MDLMTrainer):
             "t_bwd_sum": 0.0,
             "n": 0,
         }
+
+    # ---- Optimizer with loop-param LR boost -----------------------------------
+    def create_optimizer(self):
+        """Two-tier LR: loop controller (log_A, delta, B_inject, input_norm.*) at
+        `loop_lr_mult * base_lr`, base model at `base_lr`. Follows Mamba/S4
+        convention of giving SSM state-transition params a 10× LR. Weight-decay
+        grouping mirrors HF Trainer's default (ndim>=2 params get decay)."""
+        if self.optimizer is not None:
+            return self.optimizer
+        import transformers as _tfm
+
+        opt_model = self.model
+        decay_parameters = set(self.get_decay_parameter_names(opt_model))
+        base_lr = float(self.args.learning_rate)
+        loop_lr = base_lr * self.loop_lr_mult
+        wd = float(self.args.weight_decay)
+
+        groups = {
+            "base_decay":     {"params": [], "weight_decay": wd,   "lr": base_lr},
+            "base_no_decay":  {"params": [], "weight_decay": 0.0,  "lr": base_lr},
+            "loop_decay":     {"params": [], "weight_decay": wd,   "lr": loop_lr},
+            "loop_no_decay":  {"params": [], "weight_decay": 0.0,  "lr": loop_lr},
+        }
+        for n, p in opt_model.named_parameters():
+            if not p.requires_grad:
+                continue
+            is_loop = _is_loop_param_name(n)
+            is_decay = n in decay_parameters
+            key = ("loop_" if is_loop else "base_") + ("decay" if is_decay else "no_decay")
+            groups[key]["params"].append(p)
+
+        param_groups = [g for g in groups.values() if g["params"]]
+        n_loop = sum(len(g["params"]) for k, g in groups.items() if k.startswith("loop"))
+        n_base = sum(len(g["params"]) for k, g in groups.items() if k.startswith("base"))
+
+        try:
+            optimizer_cls, optimizer_kwargs = _tfm.Trainer.get_optimizer_cls_and_kwargs(
+                self.args, opt_model
+            )
+        except TypeError:
+            optimizer_cls, optimizer_kwargs = _tfm.Trainer.get_optimizer_cls_and_kwargs(self.args)
+        optimizer_kwargs.pop("lr", None)
+        self.optimizer = optimizer_cls(param_groups, **optimizer_kwargs)
+
+        if self.args.should_log:
+            print(
+                f"[MDLMLoopedTrainer] optimizer: base_lr={base_lr:.2e} "
+                f"(n_params={n_base}), loop_lr={loop_lr:.2e} (n_params={n_loop}, "
+                f"mult={self.loop_lr_mult}x)"
+            )
+        return self.optimizer
 
     # ---- Freeze/unfreeze base model ----
     def _apply_base_freeze(self, freeze: bool) -> None:

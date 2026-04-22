@@ -102,10 +102,11 @@ class TrainingArguments(dllm.core.trainers.MDLMLoopedConfig):
     per_device_eval_batch_size: int = 2
     # Looping defaults (see MDLMLoopedConfig for full list).
     mu_rec_train_mean: float = 2.0
-    mu_rec_train_min: int = 1
+    mu_rec_train_min: int = 2  # μ_rec=1 gives zero gradient to A (h_0=0), skip it
     mu_rec_train_max: int = 4
     recurrence_dist: str = "poisson"
-    mu_bwd_ratio: float = 0.5
+    mu_bwd_ratio: float = 1.0  # full BPTT through every iteration
+    loop_lr_mult: float = 10.0  # Mamba-style: loop-controller LR = 10× base LR
 
 
 def train():
