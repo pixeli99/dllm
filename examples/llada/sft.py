@@ -33,6 +33,7 @@ from functools import partial
 
 import accelerate
 import transformers
+from transformers.trainer_utils import get_last_checkpoint
 
 import dllm
 
@@ -62,6 +63,22 @@ class TrainingArguments(dllm.core.trainers.MDLMConfig):
     learning_rate: float = 2e-5
     per_device_train_batch_size: int = 4
     per_device_eval_batch_size: int = 4
+
+
+def get_resume_checkpoint(output_dir: str) -> str | None:
+    """Return the latest Trainer checkpoint under ``output_dir``, if any."""
+    if not output_dir or not os.path.isdir(output_dir):
+        return None
+
+    resume_checkpoint = get_last_checkpoint(output_dir)
+    if resume_checkpoint is not None:
+        logger.info("Auto-resuming from checkpoint: %s", resume_checkpoint)
+    else:
+        logger.info(
+            "No existing checkpoint found under %s; starting a fresh run.",
+            output_dir,
+        )
+    return resume_checkpoint
 
 
 def train():
@@ -118,7 +135,8 @@ def train():
             )
         ),
     )
-    trainer.train()
+    resume_checkpoint = get_resume_checkpoint(training_args.output_dir)
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
     trainer.save_model(os.path.join(training_args.output_dir, "checkpoint-final"))
     trainer.processing_class.save_pretrained(
         os.path.join(training_args.output_dir, "checkpoint-final")

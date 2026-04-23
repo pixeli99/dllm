@@ -21,6 +21,7 @@ accelerate launch \
   --save_only_model False \
   --overwrite_output_dir False \
   --recurrence_dist poisson \
+  --eval_strategy no \
   --mu_rec_train_mean 2 --mu_rec_train_min 2 --mu_rec_train_max 4 \
   --mu_bwd_ratio 1.0 \
   --loop_lr_mult 10.0 \
