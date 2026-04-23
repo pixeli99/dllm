@@ -17,14 +17,16 @@ target="both"
 checkpoint="latest"
 loop_root=".models/loop/full-openmath2-500k"
 baseline_root=".models/baseline/full-openmath2-500k"
-num_gpu=4
+num_gpu=8
 batch_size=1
-num_fewshot=5
-max_new_tokens=512
-steps=512
-block_size=512
+num_fewshot=0
+max_new_tokens=256
+steps=256
+block_size=64
 cfg_scale=0.0
 limit=""
+log_samples=True
+mu_rec_eval=""
 
 usage() {
   cat <<'EOF'
@@ -38,14 +40,17 @@ Options:
                                   Default: latest
   --loop_root PATH                Looped model output root.
   --baseline_root PATH            Baseline model output root.
-  --num_gpu N                     Number of accelerate processes. Default: 4
+  --num_gpu N                     Number of accelerate processes. Default: 8
   --batch_size N                  Eval generation batch size per process. Default: 1
-  --num_fewshot N                 GSM8K CoT few-shot count. Default: 5
-  --max_new_tokens N              Generated token budget. Default: 512
-  --steps N                       Diffusion sampling steps. Default: 512
-  --block_size N                  Diffusion block size. Default: 512
+  --num_fewshot N                 GSM8K CoT few-shot count. Default: 0
+  --max_new_tokens N              Generated token budget. Default: 256
+  --steps N                       Diffusion sampling steps. Default: 256
+  --block_size N                  Diffusion block size. Default: 64
   --cfg_scale X                   CFG scale. Default: 0.0
   --limit N                       Optional lm-eval limit for smoke tests.
+  --mu_rec_eval N                 Override looped checkpoint test-time recurrence.
+  --log_samples                   Save per-sample prompts, generations, and metrics. Default
+  --no_log_samples                Disable per-sample logging.
 EOF
 }
 
@@ -75,6 +80,12 @@ while [[ $# -gt 0 ]]; do
       cfg_scale="$2"; shift 2 ;;
     --limit)
       limit="$2"; shift 2 ;;
+    --mu_rec_eval)
+      mu_rec_eval="$2"; shift 2 ;;
+    --log_samples)
+      log_samples=True; shift ;;
+    --no_log_samples)
+      log_samples=False; shift ;;
     -h|--help)
       usage; exit 0 ;;
     *)
@@ -129,6 +140,9 @@ run_one() {
   local checkpoint_name
   checkpoint_name="$(basename "${model_path}")"
   local output_path=".eval/gsm8k_cot/${name}/${checkpoint_name}"
+  if [[ -n "${mu_rec_eval}" && "${name}" = "loop" ]]; then
+    output_path="${output_path}/mu${mu_rec_eval}"
+  fi
   mkdir -p "${output_path}"
 
   echo ">>> Evaluating ${name}"
@@ -136,15 +150,21 @@ run_one() {
   echo ">>> output_path: ${output_path}"
 
   local model_args
-  model_args="pretrained=${model_path},batch_size=${batch_size},max_new_tokens=${max_new_tokens},steps=${steps},block_size=${block_size},cfg_scale=${cfg_scale},suppress_tokens=[],begin_suppress_tokens=[126081;126348]"
+  model_args="pretrained=${model_path},max_new_tokens=${max_new_tokens},steps=${steps},block_size=${block_size},cfg_scale=${cfg_scale},suppress_tokens=[],begin_suppress_tokens=[126081;126348]"
+  if [[ -n "${mu_rec_eval}" && "${name}" = "loop" ]]; then
+    model_args="${model_args},mu_rec_eval=${mu_rec_eval}"
+  fi
 
   local extra_args=()
   if [[ -n "${limit}" ]]; then
     extra_args+=(--limit "${limit}")
   fi
+  if [[ "${log_samples}" = "True" ]]; then
+    extra_args+=(--log_samples)
+  fi
 
   accelerate launch --num_processes "${num_gpu}" "${repo_root}/dllm/pipelines/llada/eval.py" \
-    --tasks gsm8k_cot \
+    --tasks gsm8k_cot_zeroshot \
     --num_fewshot "${num_fewshot}" \
     --model llada \
     --apply_chat_template \

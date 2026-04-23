@@ -11,6 +11,7 @@ accelerate launch \
 
 from dataclasses import dataclass
 
+import transformers
 from lm_eval.__main__ import cli_evaluate
 from lm_eval.api.registry import register_model
 
@@ -34,6 +35,16 @@ class LLaDAEvalConfig(MDLMEvalConfig):
     # According to LLaDA's opencompass implementation:
     # https://github.com/ML-GSAI/LLaDA/blob/main/opencompass/opencompass/models/dllm.py
     max_length: int = 4096
+    mu_rec_eval: int | None = None
+
+    def get_model_config(self, pretrained: str):
+        if self.mu_rec_eval is None:
+            return None
+
+        config = transformers.AutoConfig.from_pretrained(pretrained)
+        if getattr(config, "model_type", None) == "llada_looped":
+            config.mu_rec_eval = int(self.mu_rec_eval)
+        return config
 
 
 @register_model("llada")
@@ -46,6 +57,7 @@ class LLaDAEvalHarness(MDLMEvalHarness):
         **kwargs,
     ):
         eval_config = eval_config or LLaDAEvalConfig()
+        eval_config = self._build_config(LLaDAEvalConfig, eval_config, kwargs)
         sampler_config = sampler_config or LLaDAEvalSamplerConfig()
 
         super().__init__(
