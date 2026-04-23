@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Evaluate the looped model and/or vanilla baseline on GSM8K CoT.
 # Run from anywhere:
-#   bash /Users/pixeli/dllm/scripts/looped_llada/eval_gsm8k.sh --target both
+#   bash /lustre/projects/polyullm/lipengxiang_tmp/dllm/scripts/looped_llada/eval_gsm8k.sh --target both
 
 set -euo pipefail
 
@@ -143,7 +143,7 @@ run_one() {
     extra_args+=(--limit "${limit}")
   fi
 
-  accelerate launch --num_processes "${num_gpu}" /Users/pixeli/dllm/dllm/pipelines/llada/eval.py \
+  accelerate launch --num_processes "${num_gpu}" "${repo_root}/dllm/pipelines/llada/eval.py" \
     --tasks gsm8k_cot \
     --num_fewshot "${num_fewshot}" \
     --model llada \
