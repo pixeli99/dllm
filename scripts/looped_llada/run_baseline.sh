@@ -10,6 +10,7 @@ accelerate launch \
   --output_dir .models/baseline/full-openmath2-full \
   --dataset_args .data/sft/llada/openmath2-full \
   --load_preprocessed_data True \
+  --group_by_length False \
   --num_train_epochs 3 \
   --per_device_train_batch_size 2 \
   --per_device_eval_batch_size 2 \
