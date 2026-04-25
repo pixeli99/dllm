@@ -34,6 +34,11 @@ PROXY_LOCAL_PORT="${PROXY_LOCAL_PORT:-20172}"
 PROXY_REMOTE="${PROXY_REMOTE:-10.120.32.132:8080}"
 SSH_TARGET="${SSH_TARGET:-reallm.xyz@10.112.0.4}"
 
+# HF cache must live on a writable mount — container $HOME is read-only.
+HF_HOME_DEFAULT="/lustre/projects/polyullm/lipengxiang_tmp/.cache/huggingface"
+HF_HOME_DIR="${HF_HOME_DIR:-${HF_HOME_DEFAULT}}"
+mkdir -p "${HF_HOME_DIR}"
+
 # Everything after the script name on the sbatch line goes to eval_math500.sh.
 EVAL_ARGS=("$@")
 
@@ -88,6 +93,12 @@ export https_proxy="${PROXY_URL}"
 export NO_PROXY="localhost,127.0.0.1,.local,.cluster"
 export no_proxy="localhost,127.0.0.1,.local,.cluster"
 export HF_DATASETS_TRUST_REMOTE_CODE=True
+# Redirect every HF / generic-cache path to a writable mount.
+export HF_HOME="${HF_HOME_DIR}"
+export HUGGINGFACE_HUB_CACHE="${HF_HOME_DIR}/hub"
+export HF_DATASETS_CACHE="${HF_HOME_DIR}/datasets"
+export TRANSFORMERS_CACHE="${HF_HOME_DIR}/hub"
+export XDG_CACHE_HOME="${HF_HOME_DIR}/.xdg"
 
 CONTAINER_MOUNTS="/work/projects/polyullm:/work/projects/polyullm"
 CONTAINER_MOUNTS+=",/work/projects/polyullm:/home/projects/polyullm"
@@ -99,7 +110,7 @@ srun --nodes=1 --ntasks=1 \
   --container-name="${CONTAINER_NAME}" \
   --container-image="${CONTAINER_IMAGE}" \
   --container-mounts="${CONTAINER_MOUNTS}" \
-  --container-env=HTTP_PROXY,HTTPS_PROXY,http_proxy,https_proxy,NO_PROXY,no_proxy,HF_DATASETS_TRUST_REMOTE_CODE \
+  --container-env=HTTP_PROXY,HTTPS_PROXY,http_proxy,https_proxy,NO_PROXY,no_proxy,HF_DATASETS_TRUST_REMOTE_CODE,HF_HOME,HUGGINGFACE_HUB_CACHE,HF_DATASETS_CACHE,TRANSFORMERS_CACHE,XDG_CACHE_HOME \
   bash -lc 'cd "$1" && shift && bash scripts/looped_llada/eval_math500.sh "$@"' \
   _wrap "${REPO_ROOT}" ${EVAL_ARGS[@]+"${EVAL_ARGS[@]}"}
 
