@@ -18,7 +18,7 @@ checkpoint="latest"
 loop_root=".models/loop/full-openmath2-500k"
 baseline_root=".models/baseline/full-openmath2-500k"
 num_gpu=8
-batch_size=1
+batch_size=4
 num_fewshot=0
 # MATH problems are typically longer than GSM8K — bump generation budget.
 max_new_tokens=512
