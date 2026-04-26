@@ -26,6 +26,7 @@ def load_sft_dataset(
     """
     from dllm.data.alpaca import load_dataset_alpaca
     from dllm.data.opc import load_dataset_opc_sft
+    from dllm.data.openmathinstruct2 import load_dataset_openmathinstruct2
 
     specs = [p.strip() for p in re.split(r"[|+]", dataset_args) if p.strip()]
     all_parts = []
@@ -46,6 +47,16 @@ def load_sft_dataset(
         elif _match(dataset_name_or_path, "allenai/tulu-3-sft-mixture"):
             ds = load_dataset(dataset_name_or_path)
             ds = ds["train"].train_test_split(test_size=0.05, seed=42)
+        elif _match(dataset_name_or_path, "nvidia/OpenMathInstruct-2"):
+            # Consume train/test limits early (avoids mapping 14M rows when user
+            # only wants e.g. 500k).
+            train_limit = kvs.pop("train", None)
+            test_limit = kvs.pop("test", None)
+            ds = load_dataset_openmathinstruct2(
+                dataset_name_or_path,
+                train_limit=train_limit,
+                test_limit=test_limit,
+            )
         elif _match(dataset_name_or_path, "HuggingFaceTB/smoltalk"):
             name = kvs.pop("name", "all")
             ds = load_dataset(dataset_name_or_path, name=name)

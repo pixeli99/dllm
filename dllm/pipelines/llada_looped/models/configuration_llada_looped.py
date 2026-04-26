@@ -1,0 +1,79 @@
+"""
+LLaDA-Looped configuration.
+
+Extends LLaDAConfig with a prelude/recurrent/coda layer split and
+Parcae-style middle-loop controls.
+
+Retrofit invariant (μ_rec = 1 must equal vanilla LLaDA):
+
+    h_{r+1} = R( A_disc ⊙ h_r + B_disc · e ),   h_0 = 0,  e = x_prelude
+
+At init we want `h_1 = R(x_prelude)` exactly, i.e. `A_disc ⊙ 0 + B_disc · e == e`.
+That requires `B_disc = I` at init (we ignore `A` entirely while `h_0 = 0`).
+So:
+
+    A_init_log = 5.0   -> A_disc = exp(-exp(5)·1) ≈ 0      (irrelevant initially,
+                                                            keeps state decayed)
+    delta_init = 1.0
+    B_init_identity = True  -> B_inject = I (full) or 1-vector (diag).
+    use_input_norm  = False -> e = x_prelude verbatim (no LN-induced rescale).
+"""
+
+from dllm.pipelines.llada.models.configuration_llada import LLaDAConfig, ModelConfig
+
+
+class LLaDALoopedConfig(LLaDAConfig):
+    model_type = "llada_looped"
+
+    # ModelConfig defines this as a @property; LLaDAConfig inherits from
+    # PretrainedConfig (not ModelConfig), so the property doesn't come along.
+    # Vanilla LLaDA sidesteps this via create_model_config_from_pretrained_config;
+    # we pass LLaDALoopedConfig straight through to LLaDAModel, so we need it here.
+    @property
+    def effective_n_kv_heads(self) -> int:
+        return ModelConfig.effective_n_kv_heads.fget(self)
+
+    def __init__(
+        self,
+        # ---- Layer partition ----
+        prelude_layers: int = 8,
+        recurrent_layers: int = 16,
+        coda_layers: int = 8,
+        # ---- Test-time recurrence default ----
+        mu_rec_eval: int = 2,
+        # ---- SSM stabilizer (Parcae-style) ----
+        # e = x_prelude (verbatim) when False; LayerNorm(x_prelude) when True.
+        # Default False so μ_rec=1 is exactly vanilla LLaDA.
+        use_input_norm: bool = False,
+        # Diagonal vs full B_inject matrix.
+        use_diag_B: bool = False,
+        # log_A = 0 -> A_cont = -1, A_disc = exp(-1) ≈ 0.368.
+        # With h_0 = 0, μ_rec=1 is still exactly vanilla LLaDA (A·0 = 0).
+        # Starting at A_disc ≈ 0 would dead-init the gradient: ∂A_disc/∂log_A
+        # is ~ exp(-exp(log_A)) which vanishes for log_A ≥ 5. Starting at
+        # A_disc ≈ 0.368 gives log_A real gradient signal from step 1 and
+        # immediately activates state feedback for μ_rec ≥ 2.
+        A_init_log: float = 0.0,
+        delta_init: float = 1.0,
+        # Identity init for B so B·e == e at step 0: μ_rec=1 is drop-in.
+        B_init_identity: bool = True,
+        **kwargs,
+    ):
+        kwargs.setdefault("architectures", ["LLaDALoopedModelLM"])
+        super().__init__(**kwargs)
+
+        # NB: Validity of (prelude + recurrent + coda) vs n_layers is checked
+        # in LLaDALoopedModel.__init__, not here. Reason: HF's to_diff_dict
+        # does `self.__class__()` (no kwargs) during JSON serialization, which
+        # falls back to ModelConfig's GPT-2-scale defaults (n_layers=12) and
+        # would otherwise crash the TensorBoard/WandB callbacks at train start.
+
+        self.prelude_layers = prelude_layers
+        self.recurrent_layers = recurrent_layers
+        self.coda_layers = coda_layers
+        self.mu_rec_eval = mu_rec_eval
+        self.use_input_norm = use_input_norm
+        self.use_diag_B = use_diag_B
+        self.A_init_log = A_init_log
+        self.delta_init = delta_init
+        self.B_init_identity = B_init_identity
