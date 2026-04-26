@@ -17,6 +17,7 @@ accelerate launch \
   --gradient_accumulation_steps 8 \
   --max_length 1024 \
   --learning_rate 2e-5 \
+  --num_proc=64 \
   --report_to tensorboard \
   --logging_dir .models/baseline/full-openmath2-full/tb \
   --save_steps 0.05 \

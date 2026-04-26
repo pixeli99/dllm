@@ -12,7 +12,7 @@
 #   # override container / repo location via env:
 #   REPO_ROOT=/path/to/dllm sbatch scripts/looped_llada/sbatch_eval_math500.sh ...
 #
-#SBATCH -J eval-math500
+#SBATCH -J solar-lab
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64

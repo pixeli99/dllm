@@ -15,8 +15,8 @@ export NCCL_DEBUG=warn
 
 target="both"
 checkpoint="latest"
-loop_root=".models/loop/full-openmath2-500k"
-baseline_root=".models/baseline/full-openmath2-500k"
+loop_root=".models/loop/full-openmath2-full"
+baseline_root=".models/baseline/full-openmath2-full"
 num_gpu=8
 batch_size=4
 num_fewshot=0
