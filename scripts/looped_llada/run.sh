@@ -19,7 +19,7 @@ accelerate launch \
   --per_device_train_batch_size 2 \
   --gradient_accumulation_steps 8 \
   --max_length 1024 \
-  --learning_rate 2e-6 \
+  --learning_rate 5e-4 \
   --report_to tensorboard \
   --logging_dir .models/loop_belief/openmath2-v2/tb \
   --save_steps 0.05 \
@@ -30,5 +30,5 @@ accelerate launch \
   --use_latent_feedback True \
   --t_rec_min 1 --t_rec_max 6 --t_rec_eval 4 \
   --mu_rec_eval 4 \
-  --loop_lr_mult 10.0 \
+  --loop_lr_mult 1.0 \
   --diag_log_every 50
