@@ -8,29 +8,18 @@ Extends MDLMTrainer for the latent-feedback looped LLaDA:
 
   2. 1-step truncated BPTT inside the model.
 
-  3. Stage 1 / Stage 2 freeze.
-     Stage 1: alpha is frozen at 0, T_rec forced to 1. Only RecursiveLink
-              + base finetune (within the unfrozen surface). This is the
-              probe-train phase that ensures drop-in equivalence and lets
-              recursive_link learn to produce a small delta before the gate
-              opens.
-     Stage 2: alpha unfreezes, T_rec randomized per batch. alpha may be
-              linearly warmed up over `alpha_warmup_steps`.
-
-  4. Loop-param LR multiplier (alpha + recursive_link.*).
+  3. Loop-param LR multiplier (recursive_link.*).
      10x is conservative; 50x is aggressive.
 
-  5. Trainable-surface control. Default: freeze prelude + coda transformer
+  4. Trainable-surface control. Default: freeze prelude + coda transformer
      blocks. This makes the loop's contribution cleanly attributable
      ("R is the only architectural change") and reduces optimizer state.
 
-  6. Diagnostic logging to TensorBoard:
-         loop/alpha
-         loop/alpha_scale
+  5. Diagnostic logging to TensorBoard:
          loop/T_rec
          loop/residual_norm_iter{r}    -- ||h_r - h_{r-1}|| / ||h_{r-1}||
-         loop/delta_norm_iter{r}       -- ||delta_r||
-     Use these to diagnose fixed-point convergence and alpha learning.
+         loop/adapter_update_norm_iter{r}
+     Use these to diagnose fixed-point convergence and adapter activity.
 
 Run:
     # Imported by the SFT entry:
@@ -39,7 +28,6 @@ Run:
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -62,12 +50,8 @@ class MDLMLoopedConfig(MDLMConfig):
     # Eval-time T_rec passed to model.forward when computing eval loss.
     t_rec_eval: int = 4
 
-    # ---- Stage 1 / Stage 2 ----
-    stage1_freeze_alpha: bool = False
-    alpha_warmup_steps: int = 0
-
     # ---- LR multiplier for loop params ----
-    # Loop params: alpha, recursive_link.W1, recursive_link.W2.
+    # Loop params: recursive_link.*.
     loop_lr_mult: float = 10.0
 
     # ---- Trainable-surface control ----
@@ -83,7 +67,6 @@ class MDLMLoopedConfig(MDLMConfig):
 
 # Loop-param prefixes (after the HF base_model_prefix="model" wrapping).
 _LOOP_PARAM_PREFIXES = (
-    "model.alpha",
     "model.recursive_link.",
 )
 
@@ -107,8 +90,6 @@ class MDLMLoopedTrainer(MDLMTrainer):
         assert self.t_rec_min >= 1
         assert self.t_rec_max >= self.t_rec_min
 
-        self.stage1_freeze_alpha = bool(args.stage1_freeze_alpha)
-        self.alpha_warmup_steps = int(args.alpha_warmup_steps)
         self.loop_lr_mult = float(args.loop_lr_mult)
         self.diag_log_every = max(1, int(args.diag_log_every))
 
@@ -119,17 +100,9 @@ class MDLMLoopedTrainer(MDLMTrainer):
 
         self._apply_block_freeze()
 
-        if self.stage1_freeze_alpha:
-            self._freeze_alpha(True)
-
     # ------------------------------------------------------------------
     # Param freezing
     # ------------------------------------------------------------------
-
-    def _freeze_alpha(self, freeze: bool) -> None:
-        for name, p in self.model.named_parameters():
-            if name == "model.alpha" or name.endswith(".alpha"):
-                p.requires_grad = not freeze
 
     def _apply_block_freeze(self) -> None:
         """Freeze prelude / coda transformer blocks (and optionally ln_f / wte).
@@ -256,29 +229,16 @@ class MDLMLoopedTrainer(MDLMTrainer):
     def _sample_t_rec(self, training: bool) -> int:
         if not training:
             return self.t_rec_eval
-        if self.stage1_freeze_alpha:
-            return 1
         if self.t_rec_min == self.t_rec_max:
             return self.t_rec_min
         return int(torch.randint(self.t_rec_min, self.t_rec_max + 1, ()).item())
-
-    # ------------------------------------------------------------------
-    # Alpha warmup (Stage 2)
-    # ------------------------------------------------------------------
-
-    def _alpha_scale(self) -> float:
-        if self.alpha_warmup_steps <= 0:
-            return 1.0
-        step = max(0, int(getattr(self.state, "global_step", 0)))
-        return min(1.0, step / float(self.alpha_warmup_steps))
 
     # ------------------------------------------------------------------
     # Loss
     # ------------------------------------------------------------------
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        """Mirror MDLMTrainer.compute_loss but pass T_rec / mask_token_id /
-        alpha_scale and collect loop diagnostics."""
+        """Mirror MDLMTrainer.compute_loss but pass T_rec and collect loop diagnostics."""
 
         assert self.processing_class.padding_side == "right"
         inputs = self._preprocess_inputs(inputs)
@@ -309,14 +269,11 @@ class MDLMLoopedTrainer(MDLMTrainer):
         want_diag = (
             getattr(self.state, "global_step", 0) % self.diag_log_every == 0
         ) and model.training
-        alpha_scale = self._alpha_scale() if model.training else 1.0
 
         outputs = model(
             input_ids=noised_input_ids,
             attention_mask=attention_mask,
             T_rec=T_rec,
-            mask_token_id=self.processing_class.mask_token_id,
-            alpha_scale=alpha_scale,
             output_loop_diagnostics=want_diag,
         )
         outputs = self._postprocess_outputs(outputs)
@@ -362,7 +319,6 @@ class MDLMLoopedTrainer(MDLMTrainer):
         # 7. Diagnostic logging
         if want_diag and outputs.loop_diagnostics is not None:
             diag = dict(outputs.loop_diagnostics)
-            diag["alpha_scale"] = alpha_scale
             self._log_loop_diagnostics(diag, T_rec=T_rec)
 
         return (loss, outputs) if return_outputs else loss
@@ -374,20 +330,9 @@ class MDLMLoopedTrainer(MDLMTrainer):
     def _log_loop_diagnostics(self, diag: Dict[str, Any], T_rec: int) -> None:
         log_dict: Dict[str, float] = {}
 
-        alpha = diag.get("alpha")
-        if alpha is not None:
-            try:
-                log_dict["loop/alpha"] = float(alpha.item())
-            except Exception:
-                pass
-
         log_dict["loop/T_rec"] = float(T_rec)
 
-        alpha_scale = diag.get("alpha_scale")
-        if alpha_scale is not None:
-            log_dict["loop/alpha_scale"] = float(alpha_scale)
-
-        for key in ("residual_norm", "delta_norm"):
+        for key in ("residual_norm", "adapter_update_norm"):
             seq = diag.get(key, None)
             if not seq:
                 continue

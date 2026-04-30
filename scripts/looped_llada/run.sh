@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # V2 (latent feedback): main experiment.
-# Loop applies a 2-layer residual MLP (RecursiveLink) to h_r every iter,
-# alpha-gated at mask positions.
+# Loop applies the RecursiveMAS-style RecursiveLink Adapter to h_r every iter.
 # Run from the repo root: `bash scripts/looped_llada/run.sh`
 
 set -euo pipefail
@@ -27,7 +26,6 @@ accelerate launch \
   --overwrite_output_dir False \
   --eval_strategy no \
   --use_latent_feedback True \
-  --alpha_init 0.0 \
   --t_rec_min 1 --t_rec_max 6 --t_rec_eval 4 \
   --mu_rec_eval 4 \
   --loop_lr_mult 10.0 \

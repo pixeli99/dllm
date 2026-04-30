@@ -9,24 +9,19 @@ times per forward, with two variants selected by config:
   V2 (use_latent_feedback=True), the headline design:
       h_0 = e = prelude(x)
       for r = 1, ..., T_rec:
-          delta_{r-1} = RecursiveLink(h_{r-1}.detach())   # 2-layer MLP
-          g_{r-1}     = alpha * mask_indicator * delta_{r-1}
-          h_r         = R(h_{r-1}.detach() + g_{r-1})     # 1-step truncated BPTT
+          h_input = RecursiveLink(h_{r-1}.detach())      # RecursiveMAS Adapter
+          h_r     = R(h_input)                           # 1-step truncated BPTT
 
-      RecursiveLink(h) = W_2 * GELU(W_1 * h) with W_2 zero-initialized.
-      This is the latent-feedback design from RecursiveMAS (Yang et al.,
-      2026), validated by their Theorem 4.1 to maintain stable gradients
-      across recursion (avoids the gradient-vanishing of softmax-mediated
-      feedback).
+      RecursiveLink(h) = post_ln(h + proj2(GELU(proj1(pre_ln(h))))),
+      matching RecursiveMAS' inner Adapter release code.
 
   V1 (use_latent_feedback=False), pure h-recurrence ablation:
       h_r = R(h_{r-1}.detach())
 
-Drop-in invariant: at alpha=0 (or with W_2=0 init) and T_rec=1, the model
-is numerically equivalent to vanilla LLaDA forward (a single sweep through
-prelude + R + coda blocks).
+V1 with T_rec=1 is equivalent to vanilla LLaDA. V2 is not a no-op because the
+RecursiveLink Adapter is active from the first step.
 
-BPTT: 1-step truncated -- h_in is detached every iteration. R + alpha +
+BPTT: 1-step truncated -- h_in is detached every iteration. R and
 RecursiveLink get gradient only via L_final through the last iteration.
 DEQ literature shows this is sound when R becomes contractive; the trainer
 monitors residual_norm trajectory as a fixed-point check.
@@ -48,7 +43,6 @@ import torch.nn.functional as F
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from dllm.pipelines.llada.models.modeling_llada import (
-    LayerNorm,
     LLaDAModel,
     LLaDAModelLM,
     LLaDAOutput,
@@ -71,34 +65,26 @@ class LoopedLLaDAOutput(CausalLMOutputWithPast):
 
 
 # ---------------------------------------------------------------------------
-# RecursiveLink: 2-layer residual MLP for latent feedback.
-#
-# Forward returns the "delta only" (W_2 * GELU(W_1 * h)); the loop body adds
-# the residual `h_in + alpha * mask * delta`. With W_2 zero-init, delta = 0
-# at t=0, so combined with alpha=0 the loop is a hard drop-in for vanilla
-# LLaDA at T_rec=1.
+# RecursiveLink: RecursiveMAS-style inner Adapter for latent feedback.
 # ---------------------------------------------------------------------------
 
 class RecursiveLink(nn.Module):
     def __init__(
         self,
         d_model: int,
-        d_hidden: Optional[int] = None,
         init_device: Optional[str] = None,
     ):
         super().__init__()
-        d_hidden = d_hidden if d_hidden is not None else d_model
-        self.W1 = nn.Linear(d_model, d_hidden, device=init_device)
-        self.W2 = nn.Linear(d_hidden, d_model, device=init_device)
-        # Zero-init W_2 so the link contributes nothing at t=0 (drop-in
-        # equivalence with vanilla LLaDA when combined with alpha=0).
-        with torch.no_grad():
-            self.W2.weight.zero_()
-            if self.W2.bias is not None:
-                self.W2.bias.zero_()
+        self.proj1 = nn.Linear(d_model, d_model, device=init_device)
+        self.act = nn.GELU()
+        self.proj2 = nn.Linear(d_model, d_model, device=init_device)
+        self.pre_ln = nn.LayerNorm(d_model, device=init_device)
+        self.post_ln = nn.LayerNorm(d_model, device=init_device)
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
-        return self.W2(F.gelu(self.W1(h)))
+        x = self.pre_ln(h)
+        out = self.proj2(self.act(self.proj1(x)))
+        return self.post_ln(h + out)
 
 
 # ---------------------------------------------------------------------------
@@ -138,15 +124,9 @@ class LLaDALoopedModel(LLaDAModel):
         dev = config.init_device  # set to "cuda" by LLaDALoopedModelLM.__init__
 
         if config.use_latent_feedback:
-            # alpha: scalar gate, init 0 -> drop-in at T_rec=1
-            self.alpha = nn.Parameter(
-                torch.tensor(float(config.alpha_init), device=dev)
-            )
-
-            # RecursiveLink: 2-layer residual MLP (residual is in the loop body).
-            d_hidden = config.recursive_link_hidden_dim or d
+            # RecursiveLink: RecursiveMAS-style inner Adapter.
             self.recursive_link = RecursiveLink(
-                d_model=d, d_hidden=d_hidden, init_device=dev
+                d_model=d, init_device=dev
             )
 
     # ------------------------------------------------------------------
@@ -164,8 +144,6 @@ class LLaDALoopedModel(LLaDAModel):
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
         T_rec: Optional[int] = None,
-        mask_token_id: Optional[int] = None,
-        alpha_scale: float = 1.0,
         output_loop_diagnostics: bool = False,
     ) -> Tuple[LLaDAOutput, Dict[str, Any]]:
         assert not self.config.alibi, "ALiBi not supported for MDM."
@@ -229,19 +207,9 @@ class LLaDALoopedModel(LLaDAModel):
 
         e = x  # h_0 = prelude output
 
-        # ------------- Mask indicator (V2 only) -------------
-        mask_indicator: Optional[torch.Tensor] = None
-        if self.config.use_latent_feedback and input_ids is not None:
-            if mask_token_id is None:
-                # Caller should pass mask_token_id; if absent, fall back to
-                # injecting at all positions.
-                mask_indicator = torch.ones(B_, T_, 1, device=x.device, dtype=x.dtype)
-            else:
-                mask_indicator = (input_ids == int(mask_token_id)).to(dtype=x.dtype).unsqueeze(-1)
-
         # ------------- Recurrent loop -------------
         diag_residual: List[torch.Tensor] = []
-        diag_delta_norm: List[torch.Tensor] = []
+        diag_adapter_update: List[torch.Tensor] = []
 
         h = e
         prev_h: Optional[torch.Tensor] = None
@@ -252,16 +220,11 @@ class LLaDALoopedModel(LLaDAModel):
 
             # Latent feedback (V2).
             if self.config.use_latent_feedback:
-                delta = self.recursive_link(h_in)  # [B, L, d]
-                effective_alpha = self.alpha * float(alpha_scale)
-                if mask_indicator is not None:
-                    g = effective_alpha * mask_indicator * delta
-                else:
-                    g = effective_alpha * delta
-                h_input = h_in + g
+                h_input = self.recursive_link(h_in)
                 if output_loop_diagnostics:
                     with torch.no_grad():
-                        diag_delta_norm.append(delta.norm().detach())
+                        update = (h_input - h_in).norm() / h_in.norm().clamp_min(1e-6)
+                        diag_adapter_update.append(update.detach())
             else:
                 h_input = h_in
 
@@ -311,8 +274,7 @@ class LLaDALoopedModel(LLaDAModel):
             "loop_diagnostics": (
                 {
                     "residual_norm": diag_residual,
-                    "delta_norm": diag_delta_norm,
-                    "alpha": self.alpha.detach() if self.config.use_latent_feedback else None,
+                    "adapter_update_norm": diag_adapter_update,
                     "T_rec": T_rec,
                 }
                 if output_loop_diagnostics
@@ -358,23 +320,19 @@ class LLaDALoopedModelLM(LLaDAModelLM):
         """Retrofit a pretrained vanilla LLaDA checkpoint into a looped variant.
 
         Loads vanilla LLaDA-8B weights and copies them into a freshly built
-        LLaDALoopedModelLM. Loop-specific parameters (`alpha`, `recursive_link.*`)
-        are initialized fresh; alpha=0 and W_2=0 give drop-in equivalence
-        with vanilla at T_rec=1 (and a no-op feedback at any T_rec until
-        the link learns to produce a non-zero delta).
+        LLaDALoopedModelLM. Loop-specific parameters (`recursive_link.*`) are
+        initialized fresh with PyTorch defaults.
 
         For resumes from a looped checkpoint, use the standard `from_pretrained`
-        path -- the state_dict will contain alpha + recursive_link, and
-        AutoConfig resolves to LLaDALoopedConfig via the registered
-        `model_type`.
+        path -- the state_dict will contain recursive_link weights, and AutoConfig
+        resolves to LLaDALoopedConfig via the registered `model_type`.
 
         Args:
             model_name_or_path: vanilla LLaDA checkpoint dir or HF id.
             torch_dtype: dtype for the materialized model (default bf16).
             **loop_kwargs: forwarded to LLaDALoopedConfig
                 (prelude_layers, recurrent_layers, coda_layers,
-                 use_latent_feedback, alpha_init, recursive_link_hidden_dim,
-                 mu_rec_eval).
+                 use_latent_feedback, mu_rec_eval).
         """
         from dllm.pipelines.llada.models.configuration_llada import LLaDAConfig
         from dllm.pipelines.llada.models.modeling_llada import LLaDAModelLM
@@ -428,8 +386,6 @@ class LLaDALoopedModelLM(LLaDAModelLM):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         T_rec: Optional[int] = None,
-        mask_token_id: Optional[int] = None,
-        alpha_scale: float = 1.0,
         output_loop_diagnostics: bool = False,
     ) -> Union[Tuple, LoopedLLaDAOutput]:
         if use_cache is None:
@@ -449,8 +405,6 @@ class LLaDALoopedModelLM(LLaDAModelLM):
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
             T_rec=T_rec,
-            mask_token_id=mask_token_id,
-            alpha_scale=alpha_scale,
             output_loop_diagnostics=output_loop_diagnostics,
         )
 

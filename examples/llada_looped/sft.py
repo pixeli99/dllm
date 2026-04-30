@@ -8,15 +8,14 @@ and runs full-parameter SFT via MDLMLoopedTrainer.
 Two variants selectable at the command line:
 
   V2 (default, headline): --use_latent_feedback True
-      Loop applies a 2-layer residual MLP (RecursiveLink) to h_r every
-      iteration, gated by alpha at mask positions. Drop-in at T_rec=1
-      (alpha=0 init) and at any T_rec (W_2=0 init).
+      Loop applies a RecursiveMAS-style Adapter (pre_ln -> Linear -> GELU
+      -> Linear -> residual add -> post_ln) to h_r every iteration.
 
   V1 (ablation): --use_latent_feedback False
-      Pure h-recurrence h_{r+1} = R(h_r). No alpha/recursive_link.
+      Pure h-recurrence h_{r+1} = R(h_r). No recursive_link.
 
 Trainable surface (default): blocks[prelude_layers : prelude_layers+recurrent_layers]
-+ wte (= tied lm_head) + ln_f + (V2 only) alpha + recursive_link.W1/W2.
++ wte (= tied lm_head) + ln_f + (V2 only) recursive_link.*.
 Prelude and coda blocks are frozen by default -- override with
 `--freeze_prelude False` or `--freeze_coda False` if you want full-param
 finetune.
@@ -37,12 +36,12 @@ Run:
         /Users/pixeli/dllm/examples/llada_looped/sft.py \
         --output_dir .models/LLaDA-8B-Looped/openmath2-v2
 
-    # V2 Stage 1 warmup (alpha frozen, T_rec=1, probe-train recursive_link + base):
+    # V2 T_rec=1 warmup:
     accelerate launch \
         --config_file /Users/pixeli/dllm/scripts/accelerate_configs/fsdp.yaml \
         /Users/pixeli/dllm/examples/llada_looped/sft.py \
         --output_dir .models/LLaDA-8B-Looped/openmath2-v2-stage1 \
-        --stage1_freeze_alpha True --num_train_epochs 0.5
+        --t_rec_min 1 --t_rec_max 1 --num_train_epochs 0.5
 
     # V1 ablation (pure h-recurrence):
     accelerate launch \
@@ -79,11 +78,6 @@ class LoopArguments:
     # ---- Variant ----
     # True  -> V2 (latent feedback), False -> V1 (pure h-recurrence)
     use_latent_feedback: bool = True
-    # ---- Latent-feedback hyperparameters (V2 only) ----
-    alpha_init: float = 0.0
-    # Hidden dim of the 2-layer residual MLP. None -> defaults to d_model.
-    # For LLaDA-8B (d=4096), no expansion -> ~32M params per RecursiveLink.
-    recursive_link_hidden_dim: int | None = None
     # ---- Eval-time T_rec written into config ----
     mu_rec_eval: int = 4
 
@@ -152,8 +146,6 @@ def train():
             recurrent_layers=loop_args.recurrent_layers,
             coda_layers=loop_args.coda_layers,
             use_latent_feedback=loop_args.use_latent_feedback,
-            alpha_init=loop_args.alpha_init,
-            recursive_link_hidden_dim=loop_args.recursive_link_hidden_dim,
             mu_rec_eval=loop_args.mu_rec_eval,
         )
         model = LLaDALoopedModelLM.from_llada_checkpoint(

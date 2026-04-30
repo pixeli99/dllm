@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-# V2 Stage 1 warmup: alpha frozen at 0, T_rec forced to 1.
-# Probe-trains recursive_link + (unfrozen) base while preserving exact
-# vanilla LLaDA equivalence (alpha=0 + W_2=0 init both ensure the loop
-# is a no-op). After Stage 1, resume run.sh on the saved checkpoint
-# (with --stage1_freeze_alpha False, default) to enter Stage 2.
+# V2 T_rec=1 warmup: trains RecursiveLink + the unfrozen base surface with
+# a single recurrent sweep before running the main T_rec-randomized experiment.
 # Run from the repo root: `bash scripts/looped_llada/run_stage1.sh`
 
 set -euo pipefail
@@ -29,8 +26,6 @@ accelerate launch \
   --overwrite_output_dir False \
   --eval_strategy no \
   --use_latent_feedback True \
-  --alpha_init 0.0 \
-  --stage1_freeze_alpha True \
   --t_rec_min 1 --t_rec_max 1 --t_rec_eval 1 \
   --mu_rec_eval 1 \
   --loop_lr_mult 10.0 \
