@@ -55,11 +55,16 @@ class MDLMLoopedConfig(MDLMConfig):
     loop_lr_mult: float = 10.0
 
     # ---- Trainable-surface control ----
-    # Freeze prelude / coda transformer blocks. Defaults to True for both.
+    # The default profile (all True) trains ONLY recursive_link, freezing the
+    # entire vanilla-LLaDA backbone. This isolates the loop's contribution.
+    # For V1 (use_latent_feedback=False) this leaves nothing trainable -- pass
+    # `--freeze_recurrent_blocks False --freeze_ln_f False --freeze_wte False`
+    # to recover the V1 ablation surface (R blocks + ln_f + wte trainable).
     freeze_prelude: bool = True
+    freeze_recurrent_blocks: bool = True
     freeze_coda: bool = True
-    freeze_ln_f: bool = False
-    freeze_wte: bool = False
+    freeze_ln_f: bool = True
+    freeze_wte: bool = True
 
     # ---- Diagnostics ----
     diag_log_every: int = 50
@@ -94,6 +99,7 @@ class MDLMLoopedTrainer(MDLMTrainer):
         self.diag_log_every = max(1, int(args.diag_log_every))
 
         self.freeze_prelude = bool(args.freeze_prelude)
+        self.freeze_recurrent_blocks = bool(args.freeze_recurrent_blocks)
         self.freeze_coda = bool(args.freeze_coda)
         self.freeze_ln_f = bool(args.freeze_ln_f)
         self.freeze_wte = bool(args.freeze_wte)
@@ -105,16 +111,19 @@ class MDLMLoopedTrainer(MDLMTrainer):
     # ------------------------------------------------------------------
 
     def _apply_block_freeze(self) -> None:
-        """Freeze prelude / coda transformer blocks (and optionally ln_f / wte).
+        """Freeze backbone params per the configured profile.
 
-        Prelude is already implicitly frozen by 1-step truncated BPTT, so
-        this mainly saves optimizer state. Coda freezing is the substantive
-        change: it forces R to produce hidden states that vanilla LLaDA's
-        coda already knows how to decode.
+        Defaults freeze every vanilla-LLaDA param (prelude + R + coda + ln_f
+        + wte/ff_out), leaving ONLY recursive_link.* trainable. This isolates
+        the loop's contribution and keeps optimizer state tiny.
+
+        For V1 (use_latent_feedback=False) this default leaves nothing to
+        train -- explicitly disable freeze_recurrent_blocks (and
+        ln_f / wte if you want them trainable) on the V1 launch script.
         """
         if not (
-            self.freeze_prelude or self.freeze_coda
-            or self.freeze_ln_f or self.freeze_wte
+            self.freeze_prelude or self.freeze_recurrent_blocks
+            or self.freeze_coda or self.freeze_ln_f or self.freeze_wte
         ):
             return
 
@@ -130,12 +139,18 @@ class MDLMLoopedTrainer(MDLMTrainer):
         blocks = inner.transformer.blocks
 
         n_frozen_prelude = 0
+        n_frozen_recurrent = 0
         n_frozen_coda = 0
         if self.freeze_prelude and P > 0:
             for block in blocks[:P]:
                 for p in block.parameters():
                     p.requires_grad = False
                     n_frozen_prelude += p.numel()
+        if self.freeze_recurrent_blocks and R > 0:
+            for block in blocks[P:P + R]:
+                for p in block.parameters():
+                    p.requires_grad = False
+                    n_frozen_recurrent += p.numel()
         if self.freeze_coda:
             for block in blocks[P + R:]:
                 for p in block.parameters():
@@ -166,13 +181,20 @@ class MDLMLoopedTrainer(MDLMTrainer):
             from dllm.utils import get_default_logger
             logger = get_default_logger("mdlm_looped")
             logger.info(
-                "[freeze] prelude=%d (%d params), coda=%d (%d params), "
-                "ln_f=%d, wte=%d. trainable %d / %d (%.2f%%).",
+                "[freeze] prelude=%d (%d params), recurrent_blocks=%d (%d params), "
+                "coda=%d (%d params), ln_f=%d, wte=%d. trainable %d / %d (%.2f%%).",
                 int(self.freeze_prelude), n_frozen_prelude,
+                int(self.freeze_recurrent_blocks), n_frozen_recurrent,
                 int(self.freeze_coda), n_frozen_coda,
                 n_frozen_lnf, n_frozen_wte,
                 n_train, n_total, 100.0 * n_train / max(1, n_total),
             )
+            if n_train == 0:
+                logger.warning(
+                    "[freeze] No trainable parameters left. For V1 "
+                    "(use_latent_feedback=False) you must override at least "
+                    "freeze_recurrent_blocks=False."
+                )
         except Exception:
             pass
 

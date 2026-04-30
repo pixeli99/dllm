@@ -19,7 +19,8 @@ accelerate launch \
   --config_file scripts/accelerate_configs/zero2.yaml \
   examples/llada/sft.py \
   --output_dir .models/loop_belief/openmath2-v0-baseline \
-  --dataset_args "nvidia/OpenMathInstruct-2[train:500000,test:5000]" \
+  --dataset_args ".data/sft/llada/openmath2-500k" \
+  --load_preprocessed_data True \
   --num_train_epochs 3 \
   --per_device_train_batch_size 2 \
   --per_device_eval_batch_size 2 \

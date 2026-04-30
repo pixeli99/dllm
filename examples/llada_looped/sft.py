@@ -3,7 +3,7 @@ LLaDA-Looped SFT (latent-feedback loop).
 
 Retrofits a pretrained LLaDA-8B checkpoint with a looped middle-block
 mechanism (see /Users/pixeli/dllm/dllm/pipelines/llada_looped/models/modeling_llada_looped.py)
-and runs full-parameter SFT via MDLMLoopedTrainer.
+and runs SFT via MDLMLoopedTrainer.
 
 Two variants selectable at the command line:
 
@@ -14,16 +14,17 @@ Two variants selectable at the command line:
   V1 (ablation): --use_latent_feedback False
       Pure h-recurrence h_{r+1} = R(h_r). No recursive_link.
 
-Trainable surface (default): blocks[prelude_layers : prelude_layers+recurrent_layers]
-+ wte (= tied lm_head) + ln_f + (V2 only) recursive_link.*.
-Prelude and coda blocks are frozen by default -- override with
-`--freeze_prelude False` or `--freeze_coda False` if you want full-param
-finetune.
+Default trainable surface (V2): ONLY recursive_link.*. The entire vanilla
+LLaDA backbone (prelude + R + coda + ln_f + wte) is frozen, isolating the
+loop's contribution and keeping optimizer state tiny (~33M params).
+
+For V1, the V2 freeze profile leaves nothing to train; pass
+`--freeze_recurrent_blocks False --freeze_ln_f False --freeze_wte False`
+to recover the V1 surface (R blocks + ln_f + wte trainable). See
+scripts/looped_llada/run_v1.sh.
 
 For V0 (vanilla LLaDA) full-param baseline, use
-/Users/pixeli/dllm/examples/llada/sft.py on the same data. For a
-surface-matched V0 baseline (= V1 with T_rec=1), run this entry with
---use_latent_feedback False --t_rec_min 1 --t_rec_max 1.
+/Users/pixeli/dllm/examples/llada/sft.py on the same data.
 
 Run:
     source ~/.zshrc
@@ -103,7 +104,8 @@ class TrainingArguments(dllm.core.trainers.MDLMLoopedConfig):
     per_device_train_batch_size: int = 2
     per_device_eval_batch_size: int = 2
     # MDLMLoopedConfig defaults: t_rec_min=1, t_rec_max=6, loop_lr_mult=10,
-    # freeze_prelude=True, freeze_coda=True. Override here if desired.
+    # freeze_{prelude,recurrent_blocks,coda,ln_f,wte}=True (i.e. only
+    # recursive_link trains). Override here if desired.
 
 
 def get_resume_checkpoint(output_dir: str) -> str | None:
