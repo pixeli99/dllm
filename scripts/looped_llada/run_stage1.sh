@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # V2 Stage 1 warmup: alpha frozen at 0, T_rec forced to 1.
-# Probe-trains LN_out + lm_head + base while preserving exact vanilla
-# LLaDA equivalence. After Stage 1, resume run.sh on the saved checkpoint
+# Probe-trains recursive_link + (unfrozen) base while preserving exact
+# vanilla LLaDA equivalence (alpha=0 + W_2=0 init both ensure the loop
+# is a no-op). After Stage 1, resume run.sh on the saved checkpoint
 # (with --stage1_freeze_alpha False, default) to enter Stage 2.
 # Run from the repo root: `bash scripts/looped_llada/run_stage1.sh`
 
@@ -27,10 +28,8 @@ accelerate launch \
   --save_only_model False \
   --overwrite_output_dir False \
   --eval_strategy no \
-  --use_belief_feedback True \
+  --use_latent_feedback True \
   --alpha_init 0.0 \
-  --tau 1.0 \
-  --use_belief_norm True \
   --stage1_freeze_alpha True \
   --t_rec_min 1 --t_rec_max 1 --t_rec_eval 1 \
   --mu_rec_eval 1 \

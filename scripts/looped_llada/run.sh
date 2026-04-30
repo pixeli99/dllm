@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# V2 (belief bottleneck): main experiment.
-# Loop applies soft-belief readout -> embedding -> gated injection every iter.
+# V2 (latent feedback): main experiment.
+# Loop applies a 2-layer residual MLP (RecursiveLink) to h_r every iter,
+# alpha-gated at mask positions.
 # Run from the repo root: `bash scripts/looped_llada/run.sh`
 
 set -euo pipefail
@@ -25,13 +26,9 @@ accelerate launch \
   --save_only_model False \
   --overwrite_output_dir False \
   --eval_strategy no \
-  --use_belief_feedback True \
+  --use_latent_feedback True \
   --alpha_init 0.0 \
-  --tau 1.0 \
-  --use_belief_norm True \
-  --belief_top_k 32 \
   --t_rec_min 1 --t_rec_max 6 --t_rec_eval 4 \
   --mu_rec_eval 4 \
-  --traj_beta 0.0 \
   --loop_lr_mult 10.0 \
   --diag_log_every 50

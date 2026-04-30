@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# V1 (pure h-recurrence ablation): no belief feedback.
-# Used to isolate the contribution of belief bottleneck over plain looping.
+# V1 (pure h-recurrence ablation): no latent feedback.
+# Used to isolate the contribution of RecursiveLink over plain looping.
 # Run from the repo root: `bash scripts/looped_llada/run_v1.sh`
 
 set -euo pipefail
@@ -25,9 +25,8 @@ accelerate launch \
   --save_only_model False \
   --overwrite_output_dir False \
   --eval_strategy no \
-  --use_belief_feedback False \
+  --use_latent_feedback False \
   --t_rec_min 1 --t_rec_max 6 --t_rec_eval 4 \
   --mu_rec_eval 4 \
-  --traj_beta 0.0 \
   --loop_lr_mult 1.0 \
   --diag_log_every 50

@@ -1,5 +1,5 @@
 """
-LLaDA-Looped SFT (belief-bottleneck loop).
+LLaDA-Looped SFT (latent-feedback loop).
 
 Retrofits a pretrained LLaDA-8B checkpoint with a looped middle-block
 mechanism (see /Users/pixeli/dllm/dllm/pipelines/llada_looped/models/modeling_llada_looped.py)
@@ -7,22 +7,24 @@ and runs full-parameter SFT via MDLMLoopedTrainer.
 
 Two variants selectable at the command line:
 
-  V2 (default, headline): --use_belief_feedback True
-      Loop applies soft-belief readout -> embedding -> gated injection
-      every iteration. Drop-in at T_rec=1, alpha=0.
+  V2 (default, headline): --use_latent_feedback True
+      Loop applies a 2-layer residual MLP (RecursiveLink) to h_r every
+      iteration, gated by alpha at mask positions. Drop-in at T_rec=1
+      (alpha=0 init) and at any T_rec (W_2=0 init).
 
-  V1 (ablation): --use_belief_feedback False
-      Pure h-recurrence h_{r+1} = R(h_r). No alpha/ln_out/belief_norm.
+  V1 (ablation): --use_latent_feedback False
+      Pure h-recurrence h_{r+1} = R(h_r). No alpha/recursive_link.
 
 Trainable surface (default): blocks[prelude_layers : prelude_layers+recurrent_layers]
-+ wte (= tied lm_head) + ln_f + (V2 only) alpha/ln_out/belief_norm. Prelude
-and coda blocks are frozen by default -- override with `--freeze_prelude False`
-or `--freeze_coda False` if you want full-param finetune.
++ wte (= tied lm_head) + ln_f + (V2 only) alpha + recursive_link.W1/W2.
+Prelude and coda blocks are frozen by default -- override with
+`--freeze_prelude False` or `--freeze_coda False` if you want full-param
+finetune.
 
-For V0 (vanilla LLaDA, no loop module) full-param baseline, use
+For V0 (vanilla LLaDA) full-param baseline, use
 /Users/pixeli/dllm/examples/llada/sft.py on the same data. For a
 surface-matched V0 baseline (= V1 with T_rec=1), run this entry with
---use_belief_feedback False --t_rec_min 1 --t_rec_max 1.
+--use_latent_feedback False --t_rec_min 1 --t_rec_max 1.
 
 Run:
     source ~/.zshrc
@@ -35,7 +37,7 @@ Run:
         /Users/pixeli/dllm/examples/llada_looped/sft.py \
         --output_dir .models/LLaDA-8B-Looped/openmath2-v2
 
-    # V2 Stage 1 warmup (alpha frozen, T_rec=1, probe-train ln_out + base):
+    # V2 Stage 1 warmup (alpha frozen, T_rec=1, probe-train recursive_link + base):
     accelerate launch \
         --config_file /Users/pixeli/dllm/scripts/accelerate_configs/fsdp.yaml \
         /Users/pixeli/dllm/examples/llada_looped/sft.py \
@@ -47,7 +49,7 @@ Run:
         --config_file /Users/pixeli/dllm/scripts/accelerate_configs/fsdp.yaml \
         /Users/pixeli/dllm/examples/llada_looped/sft.py \
         --output_dir .models/LLaDA-8B-Looped/openmath2-v1 \
-        --use_belief_feedback False
+        --use_latent_feedback False
 """
 
 import os
@@ -75,13 +77,13 @@ class LoopArguments:
     recurrent_layers: int = 16
     coda_layers: int = 8
     # ---- Variant ----
-    # True  -> V2 (belief bottleneck), False -> V1 (pure h-recurrence)
-    use_belief_feedback: bool = True
-    # ---- Belief-feedback hyperparameters (V2 only) ----
+    # True  -> V2 (latent feedback), False -> V1 (pure h-recurrence)
+    use_latent_feedback: bool = True
+    # ---- Latent-feedback hyperparameters (V2 only) ----
     alpha_init: float = 0.0
-    tau: float = 1.0
-    belief_top_k: int = 32
-    use_belief_norm: bool = True
+    # Hidden dim of the 2-layer residual MLP. None -> defaults to d_model.
+    # For LLaDA-8B (d=4096), no expansion -> ~32M params per RecursiveLink.
+    recursive_link_hidden_dim: int | None = None
     # ---- Eval-time T_rec written into config ----
     mu_rec_eval: int = 4
 
@@ -106,8 +108,8 @@ class TrainingArguments(dllm.core.trainers.MDLMLoopedConfig):
     learning_rate: float = 2e-5
     per_device_train_batch_size: int = 2
     per_device_eval_batch_size: int = 2
-    # MDLMLoopedConfig defaults: t_rec_min=1, t_rec_max=6, traj_beta=0,
-    # loop_lr_mult=10. Override here if desired.
+    # MDLMLoopedConfig defaults: t_rec_min=1, t_rec_max=6, loop_lr_mult=10,
+    # freeze_prelude=True, freeze_coda=True. Override here if desired.
 
 
 def get_resume_checkpoint(output_dir: str) -> str | None:
@@ -138,34 +140,28 @@ def train():
     dllm.utils.print_args(loop_args)
     dllm.utils.initial_training_setup(model_args, data_args, training_args)
 
-    # Model: retrofit vanilla LLaDA-8B into looped variant.
     from dllm.pipelines.llada_looped import LLaDALoopedModelLM
 
     resume_checkpoint = get_resume_checkpoint(training_args.output_dir)
 
     if resume_checkpoint is not None:
-        # Resuming a looped checkpoint: standard from_pretrained.
         model = LLaDALoopedModelLM.from_pretrained(resume_checkpoint)
     else:
         loop_kwargs = dict(
             prelude_layers=loop_args.prelude_layers,
             recurrent_layers=loop_args.recurrent_layers,
             coda_layers=loop_args.coda_layers,
-            use_belief_feedback=loop_args.use_belief_feedback,
+            use_latent_feedback=loop_args.use_latent_feedback,
             alpha_init=loop_args.alpha_init,
-            tau=loop_args.tau,
-            belief_top_k=loop_args.belief_top_k,
-            use_belief_norm=loop_args.use_belief_norm,
+            recursive_link_hidden_dim=loop_args.recursive_link_hidden_dim,
             mu_rec_eval=loop_args.mu_rec_eval,
         )
         model = LLaDALoopedModelLM.from_llada_checkpoint(
             model_args.model_name_or_path, **loop_kwargs
         )
 
-    # Tokenizer.
     tokenizer = dllm.utils.get_tokenizer(model_args=model_args)
 
-    # Dataset.
     with accelerate.PartialState().local_main_process_first():
         dataset = dllm.data.load_sft_dataset(
             data_args.dataset_args,
