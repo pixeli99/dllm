@@ -1,55 +1,47 @@
 """
-LLaDA-Looped SFT (latent-feedback loop).
+LLaDA-Looped SFT (V2.1-a, feedback-bridge variant).
 
 Retrofits a pretrained LLaDA-8B checkpoint with a looped middle-block
 mechanism (see /Users/pixeli/dllm/dllm/pipelines/llada_looped/models/modeling_llada_looped.py)
 and runs SFT via MDLMLoopedTrainer.
 
+V2.1-a key invariant: first-pass bypass. RecursiveLink is only applied
+on feedback transitions (r >= 1), so T_rec=1 is exactly vanilla split
+LLaDA, by construction.
+
 Two variants selectable at the command line:
 
-  V2 (default, headline): --use_latent_feedback True
-      Loop applies a RecursiveMAS-style Adapter (pre_ln -> Linear -> GELU
-      -> Linear -> residual add -> post_ln) to h_r every iteration.
+  V2.1-a (default, headline): --use_latent_feedback True
+      h_0 = e (prelude output)
+      h_1 = R(h_0)                                  # vanilla first pass
+      h_r = R(RecursiveLink(h_{r-1}.detach()))      # feedback for r >= 2
+
+      Default training T_rec ~ Uniform{2..6} (T=1 has no link gradient).
+      Default trainable surface: ONLY recursive_link.* (~33M params).
+      The vanilla LLaDA backbone (prelude + R + coda + ln_f + wte) is
+      frozen by default to isolate the loop's contribution.
 
   V1 (ablation): --use_latent_feedback False
-      Pure h-recurrence h_{r+1} = R(h_r). No recursive_link.
+      h_0 = e
+      h_1 = R(h_0)                                  # vanilla first pass
+      h_r = R(h_{r-1}.detach())                     # pure recurrence
 
-Default trainable surface (V2): ONLY recursive_link.*. The entire vanilla
-LLaDA backbone (prelude + R + coda + ln_f + wte) is frozen, isolating the
-loop's contribution and keeping optimizer state tiny (~33M params).
-
-For V1, the V2 freeze profile leaves nothing to train; pass
-`--freeze_recurrent_blocks False --freeze_ln_f False --freeze_wte False`
-to recover the V1 surface (R blocks + ln_f + wte trainable). See
-scripts/looped_llada/run_v1.sh.
+      For V1, the V2 freeze profile leaves nothing to train; pass
+      `--freeze_recurrent_blocks False --freeze_ln_f False --freeze_wte
+      False` to recover the V1 surface. See scripts/looped_llada/run_v1.sh.
 
 For V0 (vanilla LLaDA) full-param baseline, use
 /Users/pixeli/dllm/examples/llada/sft.py on the same data.
 
 Run:
-    source ~/.zshrc
-    conda activate ~/miniconda3/envs/dllm
-    cd /Users/pixeli/dllm
+    # V2.1-a main training (frozen R, only recursive_link trains):
+    bash scripts/looped_llada/run.sh
 
-    # V2 main training (FSDP, 8 GPUs):
-    accelerate launch \
-        --config_file /Users/pixeli/dllm/scripts/accelerate_configs/fsdp.yaml \
-        /Users/pixeli/dllm/examples/llada_looped/sft.py \
-        --output_dir .models/LLaDA-8B-Looped/openmath2-v2
-
-    # V2 T_rec=1 warmup:
-    accelerate launch \
-        --config_file /Users/pixeli/dllm/scripts/accelerate_configs/fsdp.yaml \
-        /Users/pixeli/dllm/examples/llada_looped/sft.py \
-        --output_dir .models/LLaDA-8B-Looped/openmath2-v2-stage1 \
-        --t_rec_min 1 --t_rec_max 1 --num_train_epochs 0.5
+    # V2.1-a + R unfreeze (P2a, larger trainable surface):
+    bash scripts/looped_llada/run_unfrozen_r.sh
 
     # V1 ablation (pure h-recurrence):
-    accelerate launch \
-        --config_file /Users/pixeli/dllm/scripts/accelerate_configs/fsdp.yaml \
-        /Users/pixeli/dllm/examples/llada_looped/sft.py \
-        --output_dir .models/LLaDA-8B-Looped/openmath2-v1 \
-        --use_latent_feedback False
+    bash scripts/looped_llada/run_v1.sh
 """
 
 import os

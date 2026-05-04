@@ -1,30 +1,41 @@
 """
-LLaDA-Looped modeling (latent-feedback loop).
+LLaDA-Looped modeling (V2.1-a, feedback-bridge variant).
 
 Subclasses LLaDAModel and LLaDAModelLM so a vanilla LLaDA-8B checkpoint
 loads in by-name without conversion. Structural change: blocks are
 partitioned into prelude / recurrent (R) / coda; R is iterated `T_rec`
-times per forward, with two variants selected by config:
+times per forward, with two variants selected by config.
 
-  V2 (use_latent_feedback=True), the headline design:
+KEY ARCHITECTURAL CHOICE (V2.1-a):
+    First-pass bypass -- the RecursiveLink is NEVER applied at r=0.
+    It is purely a feedback-transition bridge between iter r-1's R output
+    and iter r's R input (for r >= 1). This makes T_rec=1 strictly
+    equivalent to vanilla split LLaDA, by construction (not just at init).
+
+  V2 (use_latent_feedback=True):
       h_0 = e = prelude(x)
-      for r = 1, ..., T_rec:
-          h_input = RecursiveLink(h_{r-1}.detach())      # RecursiveMAS Adapter
-          h_r     = R(h_input)                           # 1-step truncated BPTT
+      h_1 = R(h_0)                                  # first pass: vanilla
+      for r = 2, ..., T_rec:
+          h_r = R(RecursiveLink(h_{r-1}.detach()))  # feedback transition
 
-      RecursiveLink(h) = post_ln(h + proj2(GELU(proj1(pre_ln(h))))),
-      matching RecursiveMAS' inner Adapter release code.
+      RecursiveLink(h) = h + proj2(GELU(proj1(pre_ln(h))))
+      proj2 is zero-initialized so the loop body starts as V1 dynamics
+      (h_{r+1} = R(h_r)) and learns a residual perturbation from there.
+      No post_ln: the residual identity path is critical for the
+      I + W2 sigma' W1 Jacobian structure (RecursiveMAS Theorem 4.1).
 
   V1 (use_latent_feedback=False), pure h-recurrence ablation:
-      h_r = R(h_{r-1}.detach())
+      h_0 = e
+      h_1 = R(h_0)                       # first pass: vanilla
+      for r = 2, ..., T_rec:
+          h_r = R(h_{r-1}.detach())      # pure recurrence, no link
 
-V1 with T_rec=1 is equivalent to vanilla LLaDA. V2 is not a no-op because the
-RecursiveLink Adapter is active from the first step.
+Both variants at T_rec=1 are numerically identical to vanilla LLaDA
+restricted to a (prelude, R, coda) partition.
 
-BPTT: 1-step truncated -- h_in is detached every iteration. R and
-RecursiveLink get gradient only via L_final through the last iteration.
-DEQ literature shows this is sound when R becomes contractive; the trainer
-monitors residual_norm trajectory as a fixed-point check.
+BPTT: 1-step truncated -- h is detached at the boundary of each
+feedback iteration (r >= 1). R and RecursiveLink get gradient only via
+L_final through the last iteration's pass.
 
 Run:
     # This module is imported by the loaded model. See:
@@ -65,7 +76,20 @@ class LoopedLLaDAOutput(CausalLMOutputWithPast):
 
 
 # ---------------------------------------------------------------------------
-# RecursiveLink: RecursiveMAS-style inner Adapter for latent feedback.
+# RecursiveLink: residual feedback bridge.
+#
+# Forward: h + proj2(GELU(proj1(pre_ln(h))))
+#
+# Design notes:
+#   - No outer LayerNorm: the residual identity path 'h + ...' is what
+#     gives the Jacobian I + W2 sigma' W1 structure. Wrapping in LN
+#     destroys both forward identity (post_ln(h) != h) and the gradient
+#     stability argument (RecursiveMAS Theorem 4.1).
+#   - proj2 weight + bias zero-initialized: at init, link(h) = h, so the
+#     loop body degenerates to V1 dynamics h_{r+1} = R(h_r), and link
+#     learns a residual perturbation from there.
+#   - Combined with first-pass bypass in LLaDALoopedModel.forward, this
+#     guarantees T_rec=1 is exactly vanilla split LLaDA.
 # ---------------------------------------------------------------------------
 
 class RecursiveLink(nn.Module):
@@ -75,16 +99,21 @@ class RecursiveLink(nn.Module):
         init_device: Optional[str] = None,
     ):
         super().__init__()
+        self.pre_ln = nn.LayerNorm(d_model, device=init_device)
         self.proj1 = nn.Linear(d_model, d_model, device=init_device)
         self.act = nn.GELU()
         self.proj2 = nn.Linear(d_model, d_model, device=init_device)
-        self.pre_ln = nn.LayerNorm(d_model, device=init_device)
-        self.post_ln = nn.LayerNorm(d_model, device=init_device)
+
+        # Zero-init proj2 -> link is identity at init (h + 0 = h).
+        with torch.no_grad():
+            self.proj2.weight.zero_()
+            if self.proj2.bias is not None:
+                self.proj2.bias.zero_()
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         x = self.pre_ln(h)
         out = self.proj2(self.act(self.proj1(x)))
-        return self.post_ln(h + out)
+        return h + out
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +153,8 @@ class LLaDALoopedModel(LLaDAModel):
         dev = config.init_device  # set to "cuda" by LLaDALoopedModelLM.__init__
 
         if config.use_latent_feedback:
-            # RecursiveLink: RecursiveMAS-style inner Adapter.
+            # RecursiveLink: residual feedback bridge applied on iterations
+            # r >= 1 only (first-pass bypass in forward).
             self.recursive_link = RecursiveLink(
                 d_model=d, init_device=dev
             )
@@ -205,28 +235,40 @@ class LLaDALoopedModel(LLaDAModel):
                 all_hidden_states.append(x)
             x, _ = block(x, attention_bias=eff_bias, layer_past=None, use_cache=False)
 
-        e = x  # h_0 = prelude output
+        e = x  # prelude output (h_0 input)
 
-        # ------------- Recurrent loop -------------
+        # ------------- Recurrent loop (V2.1-a: first-pass bypass) -------------
+        # r == 0 (first pass):
+        #   h_input = e        (no link, no detach -- vanilla R input)
+        # r >= 1 (feedback transitions):
+        #   h_input = link(h.detach())   for V2
+        #   h_input = h.detach()         for V1
+        #
+        # The first-pass bypass guarantees T_rec=1 is exactly vanilla split
+        # LLaDA, by construction. The link is a feedback-transition bridge,
+        # not a modifier of prelude output.
         diag_residual: List[torch.Tensor] = []
-        diag_adapter_update: List[torch.Tensor] = []
+        diag_adapter_update: List[torch.Tensor] = []  # only logged for r >= 1
 
         h = e
         prev_h: Optional[torch.Tensor] = None
 
         for r in range(T_rec):
-            # 1-step truncated BPTT: detach incoming h every iteration.
-            h_in = h.detach()
-
-            # Latent feedback (V2).
-            if self.config.use_latent_feedback:
-                h_input = self.recursive_link(h_in)
-                if output_loop_diagnostics:
-                    with torch.no_grad():
-                        update = (h_input - h_in).norm() / h_in.norm().clamp_min(1e-6)
-                        diag_adapter_update.append(update.detach())
+            if r == 0:
+                # First pass: no link, no detach.
+                h_input = h
             else:
-                h_input = h_in
+                # Feedback iteration: detach (1-step truncated BPTT).
+                h_in = h.detach()
+                if self.config.use_latent_feedback:
+                    h_input = self.recursive_link(h_in)
+                    if output_loop_diagnostics:
+                        with torch.no_grad():
+                            update = (h_input - h_in).norm() / h_in.norm().clamp_min(1e-6)
+                            diag_adapter_update.append(update.detach())
+                else:
+                    # V1: pure h-recurrence, no link.
+                    h_input = h_in
 
             # Run R blocks (16 layers, weight-shared across iters).
             h_out = h_input
@@ -235,7 +277,8 @@ class LLaDALoopedModel(LLaDAModel):
                     h_out, attention_bias=eff_bias, layer_past=None, use_cache=False
                 )
 
-            # Diagnostics (no_grad).
+            # Diagnostics (no_grad). Records ||h_r - h_{r-1}|| / ||h_{r-1}||
+            # for r >= 1 (i.e., len = T_rec - 1).
             if output_loop_diagnostics and prev_h is not None:
                 with torch.no_grad():
                     rel = (h_out - prev_h).norm() / prev_h.norm().clamp_min(1e-6)
@@ -321,7 +364,13 @@ class LLaDALoopedModelLM(LLaDAModelLM):
 
         Loads vanilla LLaDA-8B weights and copies them into a freshly built
         LLaDALoopedModelLM. Loop-specific parameters (`recursive_link.*`) are
-        initialized fresh with PyTorch defaults.
+        initialized in the link's __init__: pre_ln / proj1 use PyTorch
+        defaults, proj2 weight + bias zero-initialized so link is identity
+        at init.
+
+        Combined with first-pass bypass in forward, T_rec=1 is exactly
+        vanilla LLaDA -- both at init AND after training (architectural
+        drop-in, not just numerical).
 
         For resumes from a looped checkpoint, use the standard `from_pretrained`
         path -- the state_dict will contain recursive_link weights, and AutoConfig
