@@ -5,26 +5,32 @@ Retrofits a pretrained LLaDA-8B checkpoint with a looped middle-block
 mechanism (see /Users/pixeli/dllm/dllm/pipelines/llada_looped/models/modeling_llada_looped.py)
 and runs SFT via MDLMLoopedTrainer.
 
-V2.1-a key invariant: first-pass bypass. RecursiveLink is only applied
-on feedback transitions (r >= 1), so T_rec=1 is exactly vanilla split
-LLaDA, by construction.
+V2.1-a key invariants:
+  - First-pass bypass: RecursiveLink only applied on feedback transitions
+    (r >= 1), so T_rec=1 is exactly vanilla split LLaDA, by construction.
+  - Full BPTT: gradient flows end-to-end through all iterations (no
+    detach), so every iter's link/R gets direct credit from L_final.
 
 Two variants selectable at the command line:
 
   V2.1-a (default, headline): --use_latent_feedback True
       h_0 = e (prelude output)
-      h_1 = R(h_0)                                  # vanilla first pass
-      h_r = R(RecursiveLink(h_{r-1}.detach()))      # feedback for r >= 2
+      h_1 = R(h_0)                          # vanilla first pass
+      h_r = R(RecursiveLink(h_{r-1}))       # feedback transition (r >= 2)
 
       Default training T_rec ~ Uniform{2..6} (T=1 has no link gradient).
       Default trainable surface: ONLY recursive_link.* (~33M params).
       The vanilla LLaDA backbone (prelude + R + coda + ln_f + wte) is
       frozen by default to isolate the loop's contribution.
 
+      Memory: full BPTT through T_rec=6 multiplies activation memory ~6x
+      over a single forward. If you OOM, add `--gradient_checkpointing
+      True` to the run script.
+
   V1 (ablation): --use_latent_feedback False
       h_0 = e
-      h_1 = R(h_0)                                  # vanilla first pass
-      h_r = R(h_{r-1}.detach())                     # pure recurrence
+      h_1 = R(h_0)                          # vanilla first pass
+      h_r = R(h_{r-1})                      # pure recurrence (r >= 2)
 
       For V1, the V2 freeze profile leaves nothing to train; pass
       `--freeze_recurrent_blocks False --freeze_ln_f False --freeze_wte

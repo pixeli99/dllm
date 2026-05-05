@@ -6,17 +6,20 @@ loads in by-name without conversion. Structural change: blocks are
 partitioned into prelude / recurrent (R) / coda; R is iterated `T_rec`
 times per forward, with two variants selected by config.
 
-KEY ARCHITECTURAL CHOICE (V2.1-a):
-    First-pass bypass -- the RecursiveLink is NEVER applied at r=0.
-    It is purely a feedback-transition bridge between iter r-1's R output
-    and iter r's R input (for r >= 1). This makes T_rec=1 strictly
-    equivalent to vanilla split LLaDA, by construction (not just at init).
+KEY ARCHITECTURAL CHOICES (V2.1-a):
+  - First-pass bypass: the RecursiveLink is NEVER applied at r=0. It is
+    purely a feedback-transition bridge between iter r-1's R output and
+    iter r's R input (for r >= 1). This makes T_rec=1 strictly equivalent
+    to vanilla split LLaDA, by construction.
+  - Full BPTT: gradient flows through ALL iterations end-to-end, no
+    detach. This is the "whole-loop co-optimization" regime -- early
+    iterations get direct credit assignment from L_final.
 
   V2 (use_latent_feedback=True):
       h_0 = e = prelude(x)
-      h_1 = R(h_0)                                  # first pass: vanilla
+      h_1 = R(h_0)                          # first pass: vanilla
       for r = 2, ..., T_rec:
-          h_r = R(RecursiveLink(h_{r-1}.detach()))  # feedback transition
+          h_r = R(RecursiveLink(h_{r-1}))   # feedback transition (no detach)
 
       RecursiveLink(h) = h + proj2(GELU(proj1(pre_ln(h))))
       proj2 is zero-initialized so the loop body starts as V1 dynamics
@@ -26,16 +29,16 @@ KEY ARCHITECTURAL CHOICE (V2.1-a):
 
   V1 (use_latent_feedback=False), pure h-recurrence ablation:
       h_0 = e
-      h_1 = R(h_0)                       # first pass: vanilla
+      h_1 = R(h_0)                          # first pass: vanilla
       for r = 2, ..., T_rec:
-          h_r = R(h_{r-1}.detach())      # pure recurrence, no link
+          h_r = R(h_{r-1})                  # pure recurrence (no detach)
 
 Both variants at T_rec=1 are numerically identical to vanilla LLaDA
 restricted to a (prelude, R, coda) partition.
 
-BPTT: 1-step truncated -- h is detached at the boundary of each
-feedback iteration (r >= 1). R and RecursiveLink get gradient only via
-L_final through the last iteration's pass.
+Memory note: full BPTT through T_rec=6 means activation memory grows
+~6x over a single forward. Enable HF Trainer's gradient_checkpointing
+in the run script if you OOM.
 
 Run:
     # This module is imported by the loaded model. See:
@@ -237,16 +240,20 @@ class LLaDALoopedModel(LLaDAModel):
 
         e = x  # prelude output (h_0 input)
 
-        # ------------- Recurrent loop (V2.1-a: first-pass bypass) -------------
+        # ------------- Recurrent loop (V2.1-a: first-pass bypass, full BPTT) -------------
         # r == 0 (first pass):
-        #   h_input = e        (no link, no detach -- vanilla R input)
+        #   h_input = h        (no link -- vanilla R input)
         # r >= 1 (feedback transitions):
-        #   h_input = link(h.detach())   for V2
-        #   h_input = h.detach()         for V1
+        #   h_input = link(h)  for V2
+        #   h_input = h        for V1
+        #
+        # No detach anywhere -- gradient flows end-to-end through every
+        # iteration ("whole-loop co-optimization"). Each iter's R/link
+        # gets credit from L_final.
         #
         # The first-pass bypass guarantees T_rec=1 is exactly vanilla split
-        # LLaDA, by construction. The link is a feedback-transition bridge,
-        # not a modifier of prelude output.
+        # LLaDA. The link is a feedback-transition bridge, not a modifier
+        # of prelude output.
         diag_residual: List[torch.Tensor] = []
         diag_adapter_update: List[torch.Tensor] = []  # only logged for r >= 1
 
@@ -258,17 +265,16 @@ class LLaDALoopedModel(LLaDAModel):
                 # First pass: no link, no detach.
                 h_input = h
             else:
-                # Feedback iteration: detach (1-step truncated BPTT).
-                h_in = h.detach()
+                # Feedback iteration: full BPTT through link + R.
                 if self.config.use_latent_feedback:
-                    h_input = self.recursive_link(h_in)
+                    h_input = self.recursive_link(h)
                     if output_loop_diagnostics:
                         with torch.no_grad():
-                            update = (h_input - h_in).norm() / h_in.norm().clamp_min(1e-6)
-                            diag_adapter_update.append(update.detach())
+                            update = (h_input - h).norm() / h.norm().clamp_min(1e-6)
+                            diag_adapter_update.append(update)
                 else:
                     # V1: pure h-recurrence, no link.
-                    h_input = h_in
+                    h_input = h
 
             # Run R blocks (16 layers, weight-shared across iters).
             h_out = h_input
@@ -282,7 +288,7 @@ class LLaDALoopedModel(LLaDAModel):
             if output_loop_diagnostics and prev_h is not None:
                 with torch.no_grad():
                     rel = (h_out - prev_h).norm() / prev_h.norm().clamp_min(1e-6)
-                    diag_residual.append(rel.detach())
+                    diag_residual.append(rel)
             prev_h = h_out
 
             h = h_out
