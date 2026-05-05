@@ -24,6 +24,7 @@ block_size=64
 cfg_scale=0.0
 limit=""
 log_samples=True
+chat_template=True
 
 usage() {
   cat <<'EOF'
@@ -43,6 +44,11 @@ Options:
   --limit N               Optional lm-eval limit for smoke tests.
   --log_samples           Save per-sample prompts/generations. Default on.
   --no_log_samples        Disable per-sample logging.
+  --no_chat_template      Skip --apply_chat_template (use for vanilla
+                          LLaDA-8B-Base, which was NOT trained on chat
+                          format -- applying a chat template tanks the
+                          score to ~0). Default: chat template enabled
+                          (correct for SFT'd checkpoints + Instruct).
 EOF
 }
 
@@ -60,6 +66,7 @@ while [[ $# -gt 0 ]]; do
     --limit)              limit="$2"; shift 2 ;;
     --log_samples)        log_samples=True; shift ;;
     --no_log_samples)     log_samples=False; shift ;;
+    --no_chat_template)   chat_template=False; shift ;;
     -h|--help)            usage; exit 0 ;;
     *)                    echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -100,12 +107,14 @@ if [[ "${log_samples}" == "True" ]]; then
   mkdir -p "${output_dir}"
   extra_args+=( --log_samples --output_path "${output_dir}" )
 fi
+if [[ "${chat_template}" == "True" ]]; then
+  extra_args+=( --apply_chat_template )
+fi
 
 accelerate launch --num_processes "${num_gpu}" \
   dllm/pipelines/llada/eval.py \
   --tasks gsm8k_cot \
   --model llada \
-  --apply_chat_template \
   --num_fewshot "${num_fewshot}" \
   --batch_size "${batch_size}" \
   --model_args "${model_args}" \
