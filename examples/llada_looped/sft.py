@@ -66,6 +66,13 @@ logger = dllm.utils.get_default_logger(__name__)
 @dataclass
 class ModelArguments(dllm.utils.ModelArguments):
     model_name_or_path: str = "GSAI-ML/LLaDA-8B-Base"
+    # Optional warm-start from an existing looped checkpoint. When set,
+    # the trainer loads MODEL WEIGHTS ONLY from this path (not optimizer
+    # state) and starts a fresh training run from step 0 -- so the LR
+    # scheduler / freeze profile / T_rec range are taken from the current
+    # invocation, NOT from the warm-start checkpoint. Used for two-stage
+    # training (e.g. P1-frozen-R warmup -> P2a-unfrozen-R fine-tune).
+    looped_init_from: str | None = None
 
 
 @dataclass
@@ -139,7 +146,19 @@ def train():
     resume_checkpoint = get_resume_checkpoint(training_args.output_dir)
 
     if resume_checkpoint is not None:
+        # In-place resume: load model + optimizer state from output_dir.
         model = LLaDALoopedModelLM.from_pretrained(resume_checkpoint)
+    elif model_args.looped_init_from is not None:
+        # Warm-start: load model weights from a separate looped checkpoint,
+        # but DO NOT pass resume_from_checkpoint to trainer.train() so the
+        # optimizer / LR scheduler / step counter all start fresh. Used to
+        # chain stages (e.g. frozen-R warmup followed by R unfreeze).
+        logger.info(
+            "Warm-starting model weights from looped checkpoint: %s "
+            "(fresh optimizer / scheduler / step counter)",
+            model_args.looped_init_from,
+        )
+        model = LLaDALoopedModelLM.from_pretrained(model_args.looped_init_from)
     else:
         loop_kwargs = dict(
             prelude_layers=loop_args.prelude_layers,
