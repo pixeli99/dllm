@@ -17,14 +17,16 @@ KEY ARCHITECTURAL CHOICES (V2.1-a):
 
   V2 (use_latent_feedback=True):
       h_0 = e = prelude(x)
-      h_1 = R(h_0)                          # first pass: vanilla
+      h_1 = R(h_0)                              # first pass: vanilla
       for r = 2, ..., T_rec:
-          h_r = R(RecursiveLink(h_{r-1}))   # feedback transition (no detach)
+          h_r = R(RecursiveLink(h_{r-1}, r-2))  # feedback (no detach)
 
-      RecursiveLink(h) = h + proj2(GELU(proj1(pre_ln(h))))
-      proj2 is zero-initialized so the loop body starts as V1 dynamics
-      (h_{r+1} = R(h_r)) and learns a residual perturbation from there.
-      No post_ln: the residual identity path is critical for the
+      RecursiveLink(h, k) = h + proj2(GELU(proj1(pre_ln(h)*(1+gamma_k)+beta_k)))
+      where (gamma_k, beta_k) = film(step_emb[k]) is a FiLM modulation
+      keyed on the feedback-iter index k in {0, ..., T_rec-2}. Both proj2
+      and film are zero-initialized so the loop body starts as V1 dynamics
+      (h_{r+1} = R(h_r)) and learns r-specific residual perturbations from
+      there. No post_ln: the residual identity path is critical for the
       I + W2 sigma' W1 Jacobian structure (RecursiveMAS Theorem 4.1).
 
   V1 (use_latent_feedback=False), pure h-recurrence ablation:
@@ -79,20 +81,30 @@ class LoopedLLaDAOutput(CausalLMOutputWithPast):
 
 
 # ---------------------------------------------------------------------------
-# RecursiveLink: residual feedback bridge.
+# RecursiveLink: iter-conditioned residual feedback bridge.
 #
-# Forward: h + proj2(GELU(proj1(pre_ln(h))))
+# Forward: h + proj2(GELU(proj1(pre_ln(h) * (1 + gamma_r) + beta_r)))
+#   where (gamma_r, beta_r) = film(step_emb[r]) is a FiLM modulation keyed
+#   on the feedback-iteration index r in {0, ..., n_iters_max-1}.
 #
 # Design notes:
 #   - No outer LayerNorm: the residual identity path 'h + ...' is what
 #     gives the Jacobian I + W2 sigma' W1 structure. Wrapping in LN
 #     destroys both forward identity (post_ln(h) != h) and the gradient
 #     stability argument (RecursiveMAS Theorem 4.1).
-#   - proj2 weight + bias zero-initialized: at init, link(h) = h, so the
-#     loop body degenerates to V1 dynamics h_{r+1} = R(h_r), and link
-#     learns a residual perturbation from there.
+#   - proj2 zero-init -> at init link(h) = h regardless of r.
+#   - film zero-init (weight + bias) -> gamma_r = beta_r = 0 at init, so
+#     the FiLM addition is a no-op at step 0. A stage1 ckpt that lacks
+#     step_emb/film keys warm-starts to bit-identical behavior.
 #   - Combined with first-pass bypass in LLaDALoopedModel.forward, this
 #     guarantees T_rec=1 is exactly vanilla split LLaDA.
+#
+# Why iter-conditioning: the time-invariant link in earlier V2.1-a runs
+# exhibits a "T=2 trap" -- evaluation peaks at T_rec=2 and drops at T=3,4.
+# Hypothesis: one operator cannot simultaneously be the right "first big
+# reshape" AND the right "small refinement". FiLM lets the same params
+# express r-specific behavior. Cost: ~d_model * (1 + 2*d_model) params on
+# top of the existing ~3*d_model^2 link.
 # ---------------------------------------------------------------------------
 
 class RecursiveLink(nn.Module):
@@ -100,21 +112,39 @@ class RecursiveLink(nn.Module):
         self,
         d_model: int,
         init_device: Optional[str] = None,
+        n_iters_max: int = 16,
     ):
         super().__init__()
+        self.n_iters_max = int(n_iters_max)
         self.pre_ln = nn.LayerNorm(d_model, device=init_device)
         self.proj1 = nn.Linear(d_model, d_model, device=init_device)
         self.act = nn.GELU()
         self.proj2 = nn.Linear(d_model, d_model, device=init_device)
 
+        # Iter conditioning: each feedback iter r maps to its own (gamma, beta)
+        # via a learned step embedding + a single linear projection.
+        self.step_emb = nn.Embedding(self.n_iters_max, d_model, device=init_device)
+        self.film = nn.Linear(d_model, 2 * d_model, device=init_device)
+
         # Zero-init proj2 -> link is identity at init (h + 0 = h).
+        # Zero-init film -> gamma = beta = 0 at init, regardless of step_emb.
+        # Together, a fresh model and a stage1 (no FiLM) warm-start both start
+        # from link(h) = h.
         with torch.no_grad():
             self.proj2.weight.zero_()
             if self.proj2.bias is not None:
                 self.proj2.bias.zero_()
+            self.film.weight.zero_()
+            if self.film.bias is not None:
+                self.film.bias.zero_()
 
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
-        x = self.pre_ln(h)
+    def forward(self, h: torch.Tensor, iter_idx: int = 0) -> torch.Tensor:
+        # Saturate at the last bucket if T_rec exceeds n_iters_max -- late
+        # iters share an embedding (asymptotic regime).
+        idx = min(int(iter_idx), self.n_iters_max - 1)
+        e = self.step_emb.weight[idx]                  # (d,)
+        gamma, beta = self.film(e).chunk(2, dim=-1)    # (d,), (d,)
+        x = self.pre_ln(h) * (1.0 + gamma) + beta
         out = self.proj2(self.act(self.proj1(x)))
         return h + out
 
@@ -266,8 +296,10 @@ class LLaDALoopedModel(LLaDAModel):
                 h_input = h
             else:
                 # Feedback iteration: full BPTT through link + R.
+                # iter_idx = r - 1 so the first feedback transition (r=1) maps
+                # to step_emb[0]. Lets the link learn r-specific behavior.
                 if self.config.use_latent_feedback:
-                    h_input = self.recursive_link(h)
+                    h_input = self.recursive_link(h, iter_idx=r - 1)
                     if output_loop_diagnostics:
                         with torch.no_grad():
                             update = (h_input - h).norm() / h.norm().clamp_min(1e-6)

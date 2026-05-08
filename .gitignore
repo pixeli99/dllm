@@ -2,7 +2,18 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
+logs/
+.results/
+.models/
+.data/
+.wandb/
+.logs/
+.tmp/
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
 # C extensions
 *.so
 
