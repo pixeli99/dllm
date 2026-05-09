@@ -21,13 +21,18 @@ KEY ARCHITECTURAL CHOICES (V2.1-a):
       for r = 2, ..., T_rec:
           h_r = R(RecursiveLink(h_{r-1}, r-2))  # feedback (no detach)
 
-      RecursiveLink(h, k) = h + proj2(GELU(proj1(pre_ln(h)*(1+gamma_k)+beta_k)))
-      where (gamma_k, beta_k) = film(step_emb[k]) is a FiLM modulation
-      keyed on the feedback-iter index k in {0, ..., T_rec-2}. Both proj2
-      and film are zero-initialized so the loop body starts as V1 dynamics
-      (h_{r+1} = R(h_r)) and learns r-specific residual perturbations from
-      there. No post_ln: the residual identity path is critical for the
-      I + W2 sigma' W1 Jacobian structure (RecursiveMAS Theorem 4.1).
+      RecursiveLink(h, k) = h + gate_k * proj2(GELU(proj1(pre_ln(h))))
+      where gate_k = 1 + tanh(iter_gate_raw[k]) ∈ (0, 2)^d is a per-iter,
+      per-channel multiplicative gate on the link's residual output, keyed
+      on the feedback-iter index k in {0, ..., T_rec-2}. proj2 and
+      iter_gate_raw are both zero-initialized so the loop body starts as
+      V1 dynamics (h_{r+1} = R(h_r)) and learns r-specific output scales
+      from there. The gate is bounded (tanh range), so adapter_update can
+      not run away the way an input-side FiLM (γ on pre_ln output) does --
+      the previous V2.1-b design hit denoising-loss-overfitting collapse
+      around 5k steps because γ had no upper bound. No post_ln: the
+      residual identity path is critical for the I + W2 sigma' W1 Jacobian
+      structure (RecursiveMAS Theorem 4.1).
 
   V1 (use_latent_feedback=False), pure h-recurrence ablation:
       h_0 = e
@@ -81,10 +86,10 @@ class LoopedLLaDAOutput(CausalLMOutputWithPast):
 
 
 # ---------------------------------------------------------------------------
-# RecursiveLink: iter-conditioned residual feedback bridge.
+# RecursiveLink: iter-conditioned residual feedback bridge (V2.1-c, gated).
 #
-# Forward: h + proj2(GELU(proj1(pre_ln(h) * (1 + gamma_r) + beta_r)))
-#   where (gamma_r, beta_r) = film(step_emb[r]) is a FiLM modulation keyed
+# Forward: h + gate_r * proj2(GELU(proj1(pre_ln(h))))
+#   where gate_r = 1 + tanh(iter_gate_raw[r]) is a per-channel scale keyed
 #   on the feedback-iteration index r in {0, ..., n_iters_max-1}.
 #
 # Design notes:
@@ -93,18 +98,26 @@ class LoopedLLaDAOutput(CausalLMOutputWithPast):
 #     destroys both forward identity (post_ln(h) != h) and the gradient
 #     stability argument (RecursiveMAS Theorem 4.1).
 #   - proj2 zero-init -> at init link(h) = h regardless of r.
-#   - film zero-init (weight + bias) -> gamma_r = beta_r = 0 at init, so
-#     the FiLM addition is a no-op at step 0. A stage1 ckpt that lacks
-#     step_emb/film keys warm-starts to bit-identical behavior.
+#   - iter_gate_raw zero-init -> tanh(0) = 0 -> gate = 1 at init -> the
+#     gated form is exactly equivalent to the V2.1-a (time-invariant)
+#     link. A V2.1-a stage1 ckpt that lacks iter_gate_raw warm-starts to
+#     bit-identical behavior.
+#   - Bounded gate ∈ (0, 2)^d. Crucially this prevents the runaway that
+#     killed V2.1-b (input-side FiLM with unbounded gamma): there, an
+#     unbounded multiplicative modulation BEFORE the proj1 / GELU / proj2
+#     pipeline let adapter_update scale up to 5x ||h|| and the system
+#     overfit MDLM denoising loss while collapsing on GSM8K (-15 pts at
+#     5k vs 1k). Output-side gating with tanh saturation can not do that.
 #   - Combined with first-pass bypass in LLaDALoopedModel.forward, this
 #     guarantees T_rec=1 is exactly vanilla split LLaDA.
 #
-# Why iter-conditioning: the time-invariant link in earlier V2.1-a runs
-# exhibits a "T=2 trap" -- evaluation peaks at T_rec=2 and drops at T=3,4.
-# Hypothesis: one operator cannot simultaneously be the right "first big
-# reshape" AND the right "small refinement". FiLM lets the same params
-# express r-specific behavior. Cost: ~d_model * (1 + 2*d_model) params on
-# top of the existing ~3*d_model^2 link.
+# Why iter-conditioning: the V2.1-a time-invariant link exhibits a "T=2
+# trap" -- evaluation peaks at T_rec=2 and drops at T=3,4. Hypothesis:
+# the right scale of the residual feedback differs across iters (iter 0:
+# big reshape; iter 1+: small refinement). A per-iter scalar/vector gate
+# on the link's *output* gives exactly that, without input-side modulation
+# capacity that V2.1-b proved is too easy to overfit. Cost: n_iters_max *
+# d_model params (~65K), negligible vs the ~50M base link.
 # ---------------------------------------------------------------------------
 
 class RecursiveLink(nn.Module):
@@ -121,32 +134,30 @@ class RecursiveLink(nn.Module):
         self.act = nn.GELU()
         self.proj2 = nn.Linear(d_model, d_model, device=init_device)
 
-        # Iter conditioning: each feedback iter r maps to its own (gamma, beta)
-        # via a learned step embedding + a single linear projection.
-        self.step_emb = nn.Embedding(self.n_iters_max, d_model, device=init_device)
-        self.film = nn.Linear(d_model, 2 * d_model, device=init_device)
+        # Per-iter, per-channel multiplicative gate on the link's residual
+        # output. raw param (no nonlinearity stored) -> apply 1 + tanh(.) at
+        # forward to bound the effective scale to (0, 2).
+        self.iter_gate_raw = nn.Parameter(
+            torch.zeros(self.n_iters_max, d_model, device=init_device)
+        )
 
-        # Zero-init proj2 -> link is identity at init (h + 0 = h).
-        # Zero-init film -> gamma = beta = 0 at init, regardless of step_emb.
-        # Together, a fresh model and a stage1 (no FiLM) warm-start both start
-        # from link(h) = h.
+        # Zero-init proj2 -> link contribution is 0 at init (h + 0 = h).
+        # Zero-init iter_gate_raw -> 1 + tanh(0) = 1 -> at init the gated form
+        # is EXACTLY equivalent to the time-invariant V2.1-a link. A V2.1-a
+        # ckpt loaded into this module gives bit-identical behavior at step 0.
         with torch.no_grad():
             self.proj2.weight.zero_()
             if self.proj2.bias is not None:
                 self.proj2.bias.zero_()
-            self.film.weight.zero_()
-            if self.film.bias is not None:
-                self.film.bias.zero_()
+            # iter_gate_raw is already zero-initialized via torch.zeros above.
 
     def forward(self, h: torch.Tensor, iter_idx: int = 0) -> torch.Tensor:
         # Saturate at the last bucket if T_rec exceeds n_iters_max -- late
-        # iters share an embedding (asymptotic regime).
+        # iters share a gate (asymptotic regime).
         idx = min(int(iter_idx), self.n_iters_max - 1)
-        e = self.step_emb.weight[idx]                  # (d,)
-        gamma, beta = self.film(e).chunk(2, dim=-1)    # (d,), (d,)
-        x = self.pre_ln(h) * (1.0 + gamma) + beta
-        out = self.proj2(self.act(self.proj1(x)))
-        return h + out
+        out = self.proj2(self.act(self.proj1(self.pre_ln(h))))
+        gate = 1.0 + torch.tanh(self.iter_gate_raw[idx])  # (d,), ∈ (0, 2)
+        return h + gate * out
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +308,8 @@ class LLaDALoopedModel(LLaDAModel):
             else:
                 # Feedback iteration: full BPTT through link + R.
                 # iter_idx = r - 1 so the first feedback transition (r=1) maps
-                # to step_emb[0]. Lets the link learn r-specific behavior.
+                # to iter_gate_raw[0]. Lets the link's output scale differ per
+                # feedback iter (e.g. iter 0 large, iter 2 smaller).
                 if self.config.use_latent_feedback:
                     h_input = self.recursive_link(h, iter_idx=r - 1)
                     if output_loop_diagnostics:

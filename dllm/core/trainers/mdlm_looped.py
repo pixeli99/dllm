@@ -6,14 +6,16 @@ Extends MDLMTrainer for the latent-feedback looped LLaDA:
   1. Per-batch T_rec sampling (uniform over [t_rec_min, t_rec_max]).
      Same T_rec for the full batch (otherwise batched forward is impossible).
 
-  2. 1-step truncated BPTT inside the model.
+  2. Full BPTT through the recurrent loop. The model does not detach
+     feedback states, so activation memory scales roughly with T_rec.
 
   3. Loop-param LR multiplier (recursive_link.*).
      10x is conservative; 50x is aggressive.
 
-  4. Trainable-surface control. Default: freeze prelude + coda transformer
-     blocks. This makes the loop's contribution cleanly attributable
-     ("R is the only architectural change") and reduces optimizer state.
+  4. Trainable-surface control. Default: freeze the full vanilla backbone
+     (prelude + R + coda + ln_f + embeddings/head), leaving only
+     recursive_link.* trainable. This isolates the loop bridge and reduces
+     optimizer state.
 
   5. Diagnostic logging to TensorBoard:
          loop/T_rec
