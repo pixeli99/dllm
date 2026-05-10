@@ -26,11 +26,12 @@ Determinism rules (REENTRY_TD_SPEC.md §5.1):
 
 1. softmax + max for confidence is run in fp32 so the per-position
    ranking does not drift with the model's compute dtype.
-2. The actual top-K commit selection is promoted to fp64 and given a
-   ``-tie_break_eps * pos_idx`` offset so positions that are exactly
-   tied at fp32 are broken deterministically by lower index. The eps
-   is small enough (default 1e-12) that for fp32-distinct confidences
-   the original ranking is preserved (eps * T_max << fp32 precision).
+2. Top-K commit selection is a true lexicographic sort: stable
+   descending argsort on fp32 confidence, with ties broken by position
+   index ascending. No epsilon arithmetic, so fp32-distinct confidences
+   are never reordered. Earlier drafts used ``-eps * pos_idx`` which
+   could flip adjacent fp32 values when their gap dropped near
+   ``vocab_size**-1`` (typical at low-confidence positions).
 3. Temperature = 0 and stochastic_transfer = False are hard-coded; no
    flags. Any randomness here would defeat the cache's reproducibility
    contract.
@@ -73,17 +74,16 @@ class DeterministicMDLMSamplerConfig(BaseSamplerConfig):
     # by the cache builder today.
     block_size: int | None = None
     record_trajectory: bool = True
-    # Tie-break epsilon. fp64-side; default 1e-12 is below fp32 precision
-    # times any reasonable T (1e-12 * 1e6 = 1e-6 < fp32 eps ~6e-8 fails,
-    # actually no: 1e-12 * 1e6 = 1e-6 > 6e-8). For our T <= 4096 we get
-    # eps*T <= 4e-9, comfortably below fp32 distinct-value gaps.
-    tie_break_eps: float = 1e-12
 
     # Hardcoded constants surfaced here so the sampler-config hash sees
     # them. If any of these change, cached trajectories are invalidated.
     _temperature: float = 0.0
     _stochastic_transfer: bool = False
     _remasking: str = "low_confidence"
+    # Tie-break is true lexicographic (stable argsort), no epsilon. This
+    # field is part of the hash payload so a future move away from stable
+    # argsort would correctly invalidate caches.
+    _tie_break_method: str = "stable_lex"
 
 
 @dataclass
@@ -152,15 +152,20 @@ def select_top_k_commit_indices(
     confidence_fp32: torch.Tensor,
     selectable_mask: torch.Tensor,
     num_unmask_per_sample: torch.Tensor,
-    tie_break_eps: float = 1e-12,
 ) -> torch.Tensor:
     """Pick which positions to commit at this step, deterministically.
 
-    The selection runs in fp64 with a per-position ``-eps * pos_idx``
-    offset so:
-      * fp32-distinct confidences keep their original order (the offset
-        magnitude is below fp32 precision over any T_max we expect);
-      * fp32-equal confidences are broken by index, lower wins.
+    Implementation is a true lexicographic sort:
+
+    1. Sort by confidence, descending.
+    2. Tie-break by position index, ascending.
+
+    Achieved via a stable descending argsort of fp32 confidence: equal
+    values keep their input order, so the lower index naturally wins.
+    No epsilon arithmetic, so fp32-distinct confidences cannot be
+    reordered -- in particular this is robust at low-confidence
+    positions where an earlier ``-eps * pos`` shape could still flip
+    adjacent fp32 values when their gap drops to ``~vocab_size**-1``.
 
     Args:
         confidence_fp32: ``[B, T]`` fp32 -- the max softmax prob per position.
@@ -168,7 +173,6 @@ def select_top_k_commit_indices(
             both currently masked AND inside the active block window.
         num_unmask_per_sample: ``[B]`` int -- how many positions to commit
             for this sample at this step.
-        tie_break_eps: see config docstring.
 
     Returns:
         ``[B, T]`` bool -- True at the up-to-num_unmask highest-confidence
@@ -183,19 +187,20 @@ def select_top_k_commit_indices(
     B, T = confidence_fp32.shape
     device = confidence_fp32.device
 
-    confidence = confidence_fp32.double()
-    neg_inf = torch.full_like(confidence, -float("inf"))
-    confidence = torch.where(selectable_mask, confidence, neg_inf)
-
-    tie_break = -tie_break_eps * torch.arange(T, device=device, dtype=torch.float64)
-    confidence = confidence + tie_break.unsqueeze(0)
+    # Mask out non-selectable to -inf so they sort to the end of a
+    # *descending* order.
+    masked = torch.where(
+        selectable_mask, confidence_fp32, torch.full_like(confidence_fp32, -float("inf"))
+    )
+    # Stable argsort. Ascending sort of -conf == descending stable sort of conf;
+    # ties keep input order, so the lower index wins.
+    sorted_idx = (-masked).argsort(dim=-1, stable=True)  # [B, T]
 
     transfer = torch.zeros((B, T), dtype=torch.bool, device=device)
     for j in range(B):
         k = int(num_unmask_per_sample[j].item())
         if k > 0:
-            _, idx = torch.topk(confidence[j], k=k)
-            transfer[j, idx] = True
+            transfer[j, sorted_idx[j, :k]] = True
     return transfer
 
 
@@ -302,7 +307,7 @@ class DeterministicMDLMSampler(BaseSampler):
                             TrajectoryStep(step_idx=global_step_idx, **rec)
                         )
 
-                # ===== Compute commit (fp32 confidence -> fp64 + tie-break) =====
+                # ===== Compute commit (fp32 confidence + stable lex sort) =====
                 # argmax in model dtype is fine (logit ties are rare); the
                 # selection-vs-confidence ordering is what matters.
                 x0 = logits.argmax(dim=-1)
@@ -319,7 +324,6 @@ class DeterministicMDLMSampler(BaseSampler):
                     confidence_fp32=conf_fp32,
                     selectable_mask=selectable,
                     num_unmask_per_sample=num_transfer_tokens[:, step_in_block],
-                    tie_break_eps=cfg.tie_break_eps,
                 )
 
                 x0 = torch.where(mask_index_full, x0, x)
@@ -386,8 +390,8 @@ def sampler_config_hash_payload(cfg: DeterministicMDLMSamplerConfig) -> dict:
         "max_response_len": cfg.max_response_len,
         "top_k": cfg.top_k,
         "block_size": cfg.block_size if cfg.block_size is not None else cfg.max_response_len,
-        "tie_break_eps": cfg.tie_break_eps,
         "temperature": cfg._temperature,
         "stochastic_transfer": cfg._stochastic_transfer,
         "remasking": cfg._remasking,
+        "tie_break_method": cfg._tie_break_method,
     }

@@ -55,6 +55,7 @@ def _build_dataset(
     teacher_stride: int,
     sample_id_filter,
     strict_git: bool,
+    expected_teacher_path: str | None,
 ) -> TrajectoryCacheDataset:
     return TrajectoryCacheDataset(
         cache_dir=cache_dir,
@@ -62,6 +63,7 @@ def _build_dataset(
         teacher_stride=teacher_stride,
         sample_id_filter=sample_id_filter,
         strict_git=strict_git,
+        expected_teacher_path=expected_teacher_path,
     )
 
 
@@ -81,6 +83,11 @@ def train():
     logger.info("Initialising student from %s", init_from)
     model = dllm.utils.get_model(model_args=model_args, model_name_or_path=init_from)
 
+    # Pass model_name_or_path (the *intended* student init source -- not
+    # ``init_from`` which may be a resume checkpoint) so the dataset can warn
+    # if the user pointed at the wrong (TEACHER_CKPT, CACHE_DIR) pair.
+    expected_teacher = model_args.model_name_or_path
+
     with accelerate.PartialState().local_main_process_first():
         full_ds = _build_dataset(
             cache_dir=training_args.cache_dir,
@@ -88,6 +95,7 @@ def train():
             teacher_stride=training_args.teacher_stride,
             sample_id_filter=None,
             strict_git=training_args.strict_git,
+            expected_teacher_path=expected_teacher,
         )
         if training_args.val_fraction > 0:
             train_ids, val_ids = TrajectoryCacheDataset.split_sample_ids(
@@ -105,6 +113,7 @@ def train():
                 teacher_stride=training_args.teacher_stride,
                 sample_id_filter=train_ids,
                 strict_git=training_args.strict_git,
+                expected_teacher_path=None,  # already warned on full_ds
             )
             val_ds = _build_dataset(
                 cache_dir=training_args.cache_dir,
@@ -112,6 +121,7 @@ def train():
                 teacher_stride=training_args.teacher_stride,
                 sample_id_filter=val_ids,
                 strict_git=training_args.strict_git,
+                expected_teacher_path=None,
             )
         else:
             train_ds = full_ds

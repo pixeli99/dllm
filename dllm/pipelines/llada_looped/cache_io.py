@@ -427,6 +427,155 @@ def open_shard_arrays(path: str | os.PathLike) -> dict[str, np.ndarray]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Streaming shard writer (production builds; eager write_shard is for tests)
+# ---------------------------------------------------------------------------
+
+
+class StreamingShardWriter:
+    """Stream a shard directory one ``(sample, step)`` at a time, to
+    memory-mapped ``.npy`` files.
+
+    The eager :func:`write_shard` allocates the whole shard's fp32
+    ``top_k_logprobs`` array (~1.6 GB at shard_size=100, L_resp=256, K=64)
+    in RAM before converting to bf16 and dumping. For real cache builds
+    the peak is unnecessary -- we know the per-step shape upfront, so we
+    can pre-allocate memmap'd ``.npy`` files and write each ``(sample,
+    step)`` slice directly. RAM cost drops to ~per-micro-batch.
+
+    Use as a context manager::
+
+        with StreamingShardWriter(path, B=100, t_shard=512, num_steps=256,
+                                  L_resp=256, K=64,
+                                  final_sequences_pad=eos_id) as w:
+            for i in range(B):
+                w.set_sample(i, sample_id=..., prompt_len=..., final_sequence=...)
+                for step_idx in range(num_steps):
+                    w.set_step(i, step_idx, mask_state=..., top_k_indices=...,
+                                top_k_logprobs=..., neg_log_tail_mass=...,
+                                top1_conf=..., entropy=...)
+    """
+
+    _ARRAY_NAMES = (
+        "sample_ids",
+        "prompt_lens",
+        "final_sequences",
+        "mask_state_packed",
+        "top_k_indices",
+        "top_k_logprobs_bf16",
+        "neg_log_tail_mass_bf16",
+        "top1_conf_bf16",
+        "entropy_bf16",
+    )
+
+    def __init__(
+        self,
+        path: str | os.PathLike,
+        *,
+        B: int,
+        t_shard: int,
+        num_steps: int,
+        L_resp: int,
+        K: int,
+        final_sequences_pad: int = 0,
+    ):
+        self.path = Path(path)
+        self.path.mkdir(parents=True, exist_ok=True)
+        self.B = B
+        self.num_steps = num_steps
+        self.L_resp = L_resp
+        self.K = K
+        mask_packed_len = (L_resp + 7) // 8
+
+        def _mm(name: str, shape: tuple[int, ...], dtype) -> np.memmap:
+            return np.lib.format.open_memmap(
+                self.path / f"{name}.npy", mode="w+", dtype=dtype, shape=shape
+            )
+
+        self.sample_ids = _mm("sample_ids", (B,), np.int64)
+        self.prompt_lens = _mm("prompt_lens", (B,), np.int32)
+        self.final_sequences = _mm("final_sequences", (B, t_shard), np.int64)
+        if final_sequences_pad != 0:
+            self.final_sequences[:] = final_sequences_pad
+        self.mask_state_packed = _mm(
+            "mask_state_packed", (B, num_steps, mask_packed_len), np.uint8
+        )
+        self.top_k_indices = _mm("top_k_indices", (B, num_steps, L_resp, K), np.int32)
+        self.top_k_logprobs_bf16 = _mm(
+            "top_k_logprobs_bf16", (B, num_steps, L_resp, K), np.uint16
+        )
+        self.neg_log_tail_mass_bf16 = _mm(
+            "neg_log_tail_mass_bf16", (B, num_steps, L_resp), np.uint16
+        )
+        self.top1_conf_bf16 = _mm("top1_conf_bf16", (B, num_steps, L_resp), np.uint16)
+        self.entropy_bf16 = _mm("entropy_bf16", (B, num_steps, L_resp), np.uint16)
+
+    # ------------------------------------------------------------------
+    # Per-sample / per-step write hooks
+    # ------------------------------------------------------------------
+
+    def set_sample(
+        self,
+        i: int,
+        *,
+        sample_id: int,
+        prompt_len: int,
+        final_sequence: np.ndarray,
+    ) -> None:
+        self.sample_ids[i] = sample_id
+        self.prompt_lens[i] = prompt_len
+        T = int(final_sequence.shape[0])
+        self.final_sequences[i, :T] = final_sequence
+
+    def set_step(
+        self,
+        i: int,
+        step_idx: int,
+        *,
+        mask_state: np.ndarray,
+        top_k_indices: np.ndarray,
+        top_k_logprobs: np.ndarray,
+        neg_log_tail_mass: np.ndarray,
+        top1_conf: np.ndarray,
+        entropy: np.ndarray,
+    ) -> None:
+        # mask_state: bool [L_resp]; pack here so we touch a small slice.
+        packed = pack_mask_bits(mask_state.astype(bool, copy=False)[None])[0]
+        self.mask_state_packed[i, step_idx] = packed
+        self.top_k_indices[i, step_idx] = top_k_indices.astype(np.int32, copy=False)
+        self.top_k_logprobs_bf16[i, step_idx] = fp32_numpy_to_uint16_bf16(
+            top_k_logprobs.astype(np.float32, copy=False)
+        )
+        self.neg_log_tail_mass_bf16[i, step_idx] = fp32_numpy_to_uint16_bf16(
+            neg_log_tail_mass.astype(np.float32, copy=False)
+        )
+        self.top1_conf_bf16[i, step_idx] = fp32_numpy_to_uint16_bf16(
+            top1_conf.astype(np.float32, copy=False)
+        )
+        self.entropy_bf16[i, step_idx] = fp32_numpy_to_uint16_bf16(
+            entropy.astype(np.float32, copy=False)
+        )
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def __enter__(self) -> "StreamingShardWriter":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def close(self) -> None:
+        for name in self._ARRAY_NAMES:
+            arr = getattr(self, name, None)
+            if arr is not None:
+                arr.flush()
+                # Drop our reference so the OS can release the mmap. The
+                # underlying memmap object is GC'd on next collection.
+                setattr(self, name, None)
+
+
 def _validate_shard_shapes(shard: ShardData) -> None:
     B = shard.sample_ids.shape[0]
     assert shard.prompt_lens.shape == (B,)

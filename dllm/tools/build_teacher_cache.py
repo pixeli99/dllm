@@ -52,13 +52,12 @@ from dllm.core.samplers.mdlm_deterministic import (
 )
 from dllm.pipelines.llada_looped.cache_io import (
     CacheManifest,
-    ShardData,
     ShardInfo,
+    StreamingShardWriter,
     TrajectoryCacheConfig,
     _git_commit_hash,
     compute_sampler_config_hash,
     utcnow_iso,
-    write_shard,
 )
 from dllm.utils import get_model, get_tokenizer
 
@@ -180,10 +179,14 @@ def build_shard(
     sampler_cfg: DeterministicMDLMSamplerConfig,
     micro_batch_size: int,
     eos_id: int,
-) -> tuple[ShardData, int]:
-    """Run the sampler on one shard's worth of samples, return ShardData.
+    shard_dir: Path,
+) -> int:
+    """Run the sampler on one shard's worth of samples, streaming to disk.
 
-    Returns ``(shard_data, t_shard)`` where ``t_shard = max prompt_len + L_resp``.
+    Returns ``t_shard = max prompt_len + L_resp``. The shard's ``.npy``
+    files are pre-allocated as memory-maps inside ``shard_dir`` and
+    filled per (sample, step), so peak RAM stays at one micro-batch's
+    worth of trajectories instead of the whole shard's fp32 buffer.
     """
     B = len(samples)
     L_resp = sampler_cfg.max_response_len
@@ -193,60 +196,53 @@ def build_shard(
     max_prompt_len = max(int(s["prompt_ids"].shape[0]) for s in samples)
     t_shard = max_prompt_len + L_resp
 
-    sample_ids = np.zeros(B, dtype=np.int64)
-    prompt_lens = np.zeros(B, dtype=np.int32)
-    final_sequences = np.full((B, t_shard), eos_id, dtype=np.int64)
-    mask_state = np.zeros((B, num_steps, L_resp), dtype=bool)
-    top_k_indices = np.zeros((B, num_steps, L_resp, K), dtype=np.int32)
-    top_k_logprobs = np.zeros((B, num_steps, L_resp, K), dtype=np.float32)
-    neg_log_tail_mass = np.zeros((B, num_steps, L_resp), dtype=np.float32)
-    top1_conf = np.zeros((B, num_steps, L_resp), dtype=np.float32)
-    entropy = np.zeros((B, num_steps, L_resp), dtype=np.float32)
+    with StreamingShardWriter(
+        shard_dir,
+        B=B,
+        t_shard=t_shard,
+        num_steps=num_steps,
+        L_resp=L_resp,
+        K=K,
+        final_sequences_pad=eos_id,
+    ) as w:
+        for batch_start in range(0, B, micro_batch_size):
+            batch_end = min(batch_start + micro_batch_size, B)
+            batch = samples[batch_start:batch_end]
+            prompts = [torch.as_tensor(s["prompt_ids"], dtype=torch.long) for s in batch]
 
-    for batch_start in range(0, B, micro_batch_size):
-        batch_end = min(batch_start + micro_batch_size, B)
-        batch = samples[batch_start:batch_end]
-        prompts = [torch.as_tensor(s["prompt_ids"], dtype=torch.long) for s in batch]
+            out = sampler.sample_with_trajectory(prompts, sampler_cfg)
+            seq_np = out.sequences.cpu().numpy()
 
-        out = sampler.sample_with_trajectory(prompts, sampler_cfg)
-
-        seq_np = out.sequences.cpu().numpy()
-        for j, s in enumerate(batch):
-            i = batch_start + j
-            sample_ids[i] = s["sample_id"]
-            prompt_lens[i] = out.prompt_lens[j]
-            T_micro = seq_np.shape[1]
-            final_sequences[i, :T_micro] = seq_np[j]
-
-            traj = out.trajectories[j]
-            if len(traj) != num_steps:
-                raise RuntimeError(
-                    f"sample {s['sample_id']}: got {len(traj)} trajectory steps "
-                    f"but expected {num_steps}. Did the schedule emit zero-step "
-                    "rows? Check teacher_steps vs max_response_len."
+            for j, s in enumerate(batch):
+                i = batch_start + j
+                w.set_sample(
+                    i,
+                    sample_id=int(s["sample_id"]),
+                    prompt_len=int(out.prompt_lens[j]),
+                    final_sequence=seq_np[j],
                 )
-            for step_idx, ts in enumerate(traj):
-                mask_state[i, step_idx] = ts.mask_state
-                top_k_indices[i, step_idx] = ts.top_k_indices
-                top_k_logprobs[i, step_idx] = ts.top_k_logprobs
-                neg_log_tail_mass[i, step_idx] = ts.neg_log_tail_mass
-                top1_conf[i, step_idx] = ts.top1_conf
-                entropy[i, step_idx] = ts.entropy
+                traj = out.trajectories[j]
+                if len(traj) != num_steps:
+                    raise RuntimeError(
+                        f"sample {s['sample_id']}: got {len(traj)} trajectory steps "
+                        f"but expected {num_steps}. Did the schedule emit zero-step "
+                        "rows? Check teacher_steps vs max_response_len."
+                    )
+                for step_idx, ts in enumerate(traj):
+                    w.set_step(
+                        i,
+                        step_idx,
+                        mask_state=ts.mask_state,
+                        top_k_indices=ts.top_k_indices,
+                        top_k_logprobs=ts.top_k_logprobs,
+                        neg_log_tail_mass=ts.neg_log_tail_mass,
+                        top1_conf=ts.top1_conf,
+                        entropy=ts.entropy,
+                    )
+            # Free the micro-batch's trajectory list once it's flushed.
+            del out
 
-    return (
-        ShardData(
-            sample_ids=sample_ids,
-            prompt_lens=prompt_lens,
-            final_sequences=final_sequences,
-            mask_state=mask_state,
-            top_k_indices=top_k_indices,
-            top_k_logprobs=top_k_logprobs,
-            neg_log_tail_mass=neg_log_tail_mass,
-            top1_conf=top1_conf,
-            entropy=entropy,
-        ),
-        t_shard,
-    )
+    return t_shard
 
 
 # ---------------------------------------------------------------------------
@@ -370,21 +366,17 @@ def main() -> int:
             flush=True,
         )
         t0 = time.time()
-        shard_data, t_shard = build_shard(
+        t_shard = build_shard(
             samples=shard_samples,
             sampler=sampler,
             sampler_cfg=sampler_cfg,
             micro_batch_size=args.micro_batch_size,
             eos_id=eos_id,
+            shard_dir=shard_path,
         )
-        t_sample = time.time() - t0
-        print(f"[info]   sampled in {t_sample:.1f}s", flush=True)
-
-        t1 = time.time()
-        write_shard(shard_path, shard_data)
-        t_write = time.time() - t1
+        t_total = time.time() - t0
         size_mb = sum(p.stat().st_size for p in shard_path.rglob("*.npy")) / (1 << 20)
-        print(f"[info]   wrote {size_mb:.1f} MB in {t_write:.1f}s", flush=True)
+        print(f"[info]   sampled+wrote {size_mb:.1f} MB in {t_total:.1f}s", flush=True)
 
         manifest.shards.append(
             ShardInfo(

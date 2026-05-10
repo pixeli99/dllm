@@ -208,7 +208,11 @@ per-step access during training, so we don't use it):
 
 Public API:
 ```python
-def write_shard(path, shard: ShardData) -> None: ...
+def write_shard(path, shard: ShardData) -> None: ...                       # tests / audit, eager
+class StreamingShardWriter:                                                # production builds
+    """Pre-allocates memmap'd .npy files; set_sample / set_step write per
+    (sample, step). Caps RAM at one micro-batch's trajectories instead of
+    the full shard's fp32 buffer."""
 def read_shard(path, mmap=True, materialize_fp32=True) -> ShardData: ...   # tests / audit
 def open_shard_arrays(path) -> dict[str, np.ndarray]: ...                  # training; np.memmap views
 def CacheManifest.load(cache_dir, strict_git=False) -> CacheManifest: ...
@@ -494,13 +498,15 @@ Data-driven only. Two axes:
 2. **Tail mass storage**: `neg_log_tail_mass = -log(1 - sum_top_k)`.
    Reverse: `tail_mass = exp(-neg_log_tail_mass)`. Underflow at very
    confident steps is acceptable -- KL contribution becomes 0.
-3. **Tie-break in fp64.** The deterministic sampler promotes confidence
-   to fp64 for the commit-selection ``topk`` and adds a per-position
-   ``-1e-12 * pos_idx`` offset. The eps is small enough that for
-   fp32-distinct confidences ordering is preserved (``eps * T`` stays
-   well below fp32 precision). The straight ``-1e-7 * pos`` shape from
-   an earlier draft is wrong: at T=1024 it perturbs by 1e-4, which
-   *does* reorder fp32-distinct positions.
+3. **Tie-break is true lexicographic, no eps.** The deterministic
+   sampler picks commit indices by ``argsort(stable=True)`` on the fp32
+   confidence (descending). Equal confidences keep their input order, so
+   the lower index naturally wins. Two earlier eps-based shapes were
+   both wrong: ``-1e-7 * pos`` perturbed by 1e-4 at T=1024 (way above
+   fp32 ULP); ``-1e-12 * pos`` was safe at high confidence but flipped
+   adjacent fp32 values at low confidence (~``1/V``), where the ULP gap
+   is ~1e-13. Stable argsort is the only correct shape -- it adds zero
+   numerical noise, so fp32-distinct confidences cannot be reordered.
 4. **Coarse KL**: clamp `student_top_k_mass` at `1 - 1e-6` before
    `log1p` -- otherwise NaN gradient at confident student.
 5. **Cache compatibility stamp**. Manifest records

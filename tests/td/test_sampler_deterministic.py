@@ -216,10 +216,10 @@ def test_sampler_hash_payload_includes_determinism_fields():
         "max_response_len",
         "top_k",
         "block_size",
-        "tie_break_eps",
         "temperature",
         "stochastic_transfer",
         "remasking",
+        "tie_break_method",
     ):
         assert must_have in payload, f"missing {must_have}"
 
@@ -232,6 +232,80 @@ def test_sampler_hash_changes_with_top_k():
     h64 = compute_sampler_config_hash(sampler_config_hash_payload(cfg64))
     h128 = compute_sampler_config_hash(sampler_config_hash_payload(cfg128))
     assert h64 != h128
+
+
+# ---------------------------------------------------------------------------
+# Tie-break: stable lex sort never reorders fp32-distinct values
+# ---------------------------------------------------------------------------
+
+
+def test_select_top_k_does_not_reorder_fp32_distinct_low_confidence():
+    """fp32-distinct confidences at low magnitude (e.g. 1e-6 range, where the
+    fp32 ULP gap is ~1e-13) must not be reordered by the tie-break path.
+
+    The earlier ``-eps * pos`` shape with eps=1e-12 and T=4096 produced a
+    total offset of ~4e-9, which exceeds these gaps and could flip
+    adjacent values. The stable-argsort path has no eps so it cannot.
+    """
+    from dllm.core.samplers.mdlm_deterministic import select_top_k_commit_indices
+
+    T = 4096
+    # Build confidence values whose differences (max - second-max etc) are
+    # ~1 ULP at magnitude 1e-6 (8e-13). Lay them in the array such that a
+    # naive ``-eps * pos`` would flip them.
+    base = 1e-6
+    eps_fp32 = np.spacing(np.float32(base))  # ~8.5e-14 around 1e-6
+    confidence = torch.tensor(
+        [base + i * eps_fp32 for i in range(T)],
+        dtype=torch.float32,
+    ).unsqueeze(0)
+    # Reverse: largest at position 0, smallest at position T-1.
+    confidence = confidence.flip(dims=[1])
+    selectable = torch.ones((1, T), dtype=torch.bool)
+    num_unmask = torch.tensor([1], dtype=torch.long)
+
+    transfer = select_top_k_commit_indices(
+        confidence_fp32=confidence,
+        selectable_mask=selectable,
+        num_unmask_per_sample=num_unmask,
+    )
+    # Position 0 has the largest confidence; it must be the one picked.
+    chosen = int(transfer[0].nonzero(as_tuple=False).item())
+    assert chosen == 0, (
+        f"expected position 0 (highest confidence) to be picked; got {chosen}. "
+        "Tie-break implementation is reordering fp32-distinct values."
+    )
+
+
+def test_select_top_k_breaks_exact_ties_by_lower_index():
+    """All-equal confidence -> pick lowest-index first."""
+    from dllm.core.samplers.mdlm_deterministic import select_top_k_commit_indices
+
+    T = 32
+    confidence = torch.full((1, T), 0.5, dtype=torch.float32)
+    selectable = torch.ones((1, T), dtype=torch.bool)
+    transfer = select_top_k_commit_indices(
+        confidence_fp32=confidence,
+        selectable_mask=selectable,
+        num_unmask_per_sample=torch.tensor([3], dtype=torch.long),
+    )
+    chosen = transfer[0].nonzero(as_tuple=False).flatten().tolist()
+    assert chosen == [0, 1, 2], chosen
+
+
+def test_select_top_k_skips_non_selectable():
+    from dllm.core.samplers.mdlm_deterministic import select_top_k_commit_indices
+
+    confidence = torch.tensor([[0.9, 0.95, 0.7, 0.8, 0.6]], dtype=torch.float32)
+    selectable = torch.tensor([[True, False, True, True, True]])
+    transfer = select_top_k_commit_indices(
+        confidence_fp32=confidence,
+        selectable_mask=selectable,
+        num_unmask_per_sample=torch.tensor([2], dtype=torch.long),
+    )
+    chosen = set(transfer[0].nonzero(as_tuple=False).flatten().tolist())
+    # Top among selectable: 0 (0.9), 3 (0.8). Position 1 (0.95) is masked out.
+    assert chosen == {0, 3}, chosen
 
 
 # ---------------------------------------------------------------------------

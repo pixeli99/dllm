@@ -22,6 +22,7 @@ from dllm.pipelines.llada_looped.cache_io import (
     CacheManifest,
     ShardData,
     ShardInfo,
+    StreamingShardWriter,
     TrajectoryCacheConfig,
     compute_sampler_config_hash,
     fp32_numpy_to_uint16_bf16,
@@ -179,6 +180,117 @@ def test_shard_validates_shapes():
     shard.top_k_indices = shard.top_k_indices[..., :5]  # break K
     with tempfile.TemporaryDirectory() as td, pytest.raises(AssertionError):
         write_shard(os.path.join(td, "shard_0000"), shard)
+
+
+# ---------------------------------------------------------------------------
+# StreamingShardWriter parity
+# ---------------------------------------------------------------------------
+
+
+def test_streaming_writer_matches_eager_write():
+    """``StreamingShardWriter`` and ``write_shard(ShardData)`` should
+    produce caches that read back identically up to bf16 precision.
+
+    The two paths are intended to be equivalent: eager builds a buffered
+    ShardData and dumps; streaming writes per-(sample, step). The
+    streaming writer is what the production builder uses to keep peak
+    RAM at one micro-batch's worth instead of the whole shard's fp32
+    buffer.
+    """
+    shard = _make_shard(B=3, num_steps=4, L_resp=8, K=8)
+    B = shard.sample_ids.shape[0]
+    num_steps = shard.mask_state.shape[1]
+    L_resp = shard.mask_state.shape[2]
+    K = shard.top_k_indices.shape[-1]
+    t_shard = shard.final_sequences.shape[1]
+
+    with tempfile.TemporaryDirectory() as td:
+        eager_dir = os.path.join(td, "eager")
+        write_shard(eager_dir, shard)
+
+        stream_dir = os.path.join(td, "stream")
+        with StreamingShardWriter(
+            stream_dir, B=B, t_shard=t_shard, num_steps=num_steps,
+            L_resp=L_resp, K=K, final_sequences_pad=0,
+        ) as w:
+            for i in range(B):
+                w.set_sample(
+                    i,
+                    sample_id=int(shard.sample_ids[i]),
+                    prompt_len=int(shard.prompt_lens[i]),
+                    final_sequence=shard.final_sequences[i],
+                )
+                for step_idx in range(num_steps):
+                    w.set_step(
+                        i, step_idx,
+                        mask_state=shard.mask_state[i, step_idx],
+                        top_k_indices=shard.top_k_indices[i, step_idx],
+                        top_k_logprobs=shard.top_k_logprobs[i, step_idx],
+                        neg_log_tail_mass=shard.neg_log_tail_mass[i, step_idx],
+                        top1_conf=shard.top1_conf[i, step_idx],
+                        entropy=shard.entropy[i, step_idx],
+                    )
+
+        eager = read_shard(eager_dir, mmap=False, materialize_fp32=True)
+        stream = read_shard(stream_dir, mmap=False, materialize_fp32=True)
+
+    np.testing.assert_array_equal(eager.sample_ids, stream.sample_ids)
+    np.testing.assert_array_equal(eager.prompt_lens, stream.prompt_lens)
+    np.testing.assert_array_equal(eager.final_sequences, stream.final_sequences)
+    np.testing.assert_array_equal(eager.mask_state, stream.mask_state)
+    np.testing.assert_array_equal(eager.top_k_indices, stream.top_k_indices)
+    # bf16 fields go through identical fp32->uint16->fp32 paths so they
+    # should match bit-for-bit.
+    for name in ("top_k_logprobs", "neg_log_tail_mass", "top1_conf", "entropy"):
+        np.testing.assert_array_equal(
+            getattr(eager, name), getattr(stream, name), err_msg=name
+        )
+
+
+def test_streaming_writer_pads_final_sequences_with_eos():
+    """``final_sequences_pad`` initializes the trailing per-sample columns
+    so a partial set_sample (e.g. when a sample's prompt is shorter than
+    the shard's max) leaves EOS, not zeros, in the gap.
+    """
+    B = 2
+    t_shard = 10
+    num_steps = 2
+    L_resp = 4
+    K = 4
+    eos_id = 999
+
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "shard")
+        with StreamingShardWriter(
+            path, B=B, t_shard=t_shard, num_steps=num_steps,
+            L_resp=L_resp, K=K, final_sequences_pad=eos_id,
+        ) as w:
+            # Sample 0: full row.
+            w.set_sample(
+                0, sample_id=0, prompt_len=3,
+                final_sequence=np.arange(t_shard, dtype=np.int64),
+            )
+            # Sample 1: partial row (only first 5 positions).
+            w.set_sample(
+                1, sample_id=1, prompt_len=2,
+                final_sequence=np.array([10, 11, 12, 13, 14], dtype=np.int64),
+            )
+            for i in range(B):
+                for s in range(num_steps):
+                    w.set_step(
+                        i, s,
+                        mask_state=np.zeros(L_resp, dtype=bool),
+                        top_k_indices=np.zeros((L_resp, K), dtype=np.int32),
+                        top_k_logprobs=np.zeros((L_resp, K), dtype=np.float32),
+                        neg_log_tail_mass=np.zeros(L_resp, dtype=np.float32),
+                        top1_conf=np.zeros(L_resp, dtype=np.float32),
+                        entropy=np.zeros(L_resp, dtype=np.float32),
+                    )
+
+        rt = read_shard(path, mmap=False, materialize_fp32=True)
+
+    assert rt.final_sequences[0].tolist() == list(range(t_shard))
+    assert rt.final_sequences[1].tolist() == [10, 11, 12, 13, 14] + [eos_id] * 5
 
 
 # ---------------------------------------------------------------------------
