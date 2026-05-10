@@ -4,10 +4,10 @@
 # Forward at T_rec=K:
 #   h_0 = e (prelude output)
 #   h_1 = R(h_0)                      # vanilla first pass (matches V2.1-a)
-#   h_r = R(h_{r-1}.detach())         # pure recurrence, no link, for r >= 2
+#   h_r = R(h_{r-1})                  # pure recurrence, no link, no detach
 #
 # V1 isolates the contribution of RecursiveLink: V2.1-a vs V1 differ only
-# in whether feedback transitions go through link or are bare detach.
+# in whether feedback transitions go through link or are bare h recurrence.
 # V1 has no recursive_link, so the V2 default freeze profile (which trains
 # only recursive_link) is overridden here -- R blocks + ln_f + wte must
 # stay trainable. Training T_rec ~ Uniform{1..6} (T=1 is meaningful for V1

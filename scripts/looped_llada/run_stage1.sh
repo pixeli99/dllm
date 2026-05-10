@@ -1,9 +1,20 @@
 #!/usr/bin/env bash
-# V2 T_rec=1 warmup: trains RecursiveLink + the unfrozen base surface with
-# a single recurrent sweep before running the main T_rec-randomized experiment.
-# Run from the repo root: `bash scripts/looped_llada/run_stage1.sh`
+# Deprecated historical script.
+#
+# Under the current first-pass-bypass design, T_rec=1 never calls
+# RecursiveLink. With the default freeze profile, this means the old warmup
+# below does not train the loop bridge at all. Use:
+#
+#   bash scripts/looped_llada/run_stage1_frozen.sh
+#   bash scripts/looped_llada/run_stage2_unfrozen.sh
+#
+# This script exits before launching to avoid wasting cluster GPU time.
 
 set -euo pipefail
+
+echo "Error: scripts/looped_llada/run_stage1.sh is deprecated." >&2
+echo "Use run_stage1_frozen.sh, then run_stage2_unfrozen.sh." >&2
+exit 2
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${repo_root}"
