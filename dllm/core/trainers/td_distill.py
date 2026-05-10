@@ -1,0 +1,340 @@
+"""TD distillation trainer + cache-backed dataset.
+
+How to run a training job (see also ``examples/llada_looped/sft_td.py``)::
+
+    accelerate launch \\
+        --config_file scripts/accelerate_configs/zero2.yaml \\
+        examples/llada_looped/sft_td.py \\
+        --cache_dir .cache/teacher_traj/openmath2-1k-256step \\
+        --student_steps 128 \\
+        --output_dir .models/loop_belief/td-p0-128
+
+Scope:
+
+This module covers REENTRY_TD_SPEC.md §6 (Phase 2 / P0) only. P0's
+student is a *vanilla* LLaDA -- no inner loop, no manifold re-entry.
+Each batch item is one ``(sample_id, student_step)`` pair. The student
+runs a single forward at the corresponding teacher step's mask state
+and is supervised by coarse KL against teacher's recorded top-K
+distribution at that step.
+
+Phase 4 / 7 will subclass / extend this trainer for the inner-loop
+cases. We deliberately do *not* try to pre-fold those concerns in here.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+import transformers
+from torch.utils.data import Dataset
+
+from dllm.core.trainers.td_losses import coarse_kl_with_tail
+from dllm.pipelines.llada_looped.cache_io import (
+    CacheManifest,
+    reconstruct_input_at_step,
+    uint16_bf16_to_fp32_numpy,
+    unpack_mask_bits,
+)
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TDDistillConfig(transformers.TrainingArguments):
+    """Adds cache + student-step settings on top of TrainingArguments.
+
+    P0 only needs the four fields below. Phase 4/7 will add T_rec and
+    per-step lambdas in their own subclass; do not pre-add them here.
+    """
+
+    cache_dir: str = ""
+    student_steps: int = 128
+    teacher_stride: int = 0  # 0 means "auto = teacher_steps // student_steps"
+    val_fraction: float = 0.0  # 0 disables held-out eval
+    allow_stale_cache: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Cache-backed dataset
+# ---------------------------------------------------------------------------
+
+
+class TrajectoryCacheDataset(Dataset):
+    """Indexes a teacher trajectory cache as ``(sample, student_step)`` pairs.
+
+    Each ``__getitem__`` returns one training example: the teacher's
+    masked input at the mapped teacher step, plus the teacher's top-K
+    target distribution at that step.
+
+    Shards are mmap'd lazily per process; safe to use with multiple
+    DataLoader workers.
+    """
+
+    def __init__(
+        self,
+        cache_dir: str | Path,
+        student_steps: int,
+        teacher_stride: int = 0,
+        sample_id_filter: Optional[set[int]] = None,
+        allow_stale_cache: bool = False,
+    ):
+        self.cache_dir = Path(cache_dir)
+        self.manifest = CacheManifest.load(self.cache_dir, allow_stale=allow_stale_cache)
+        cfg = self.manifest.config
+
+        if teacher_stride <= 0:
+            teacher_stride = cfg.teacher_steps // student_steps
+        if teacher_stride * student_steps != cfg.teacher_steps:
+            raise ValueError(
+                f"teacher_stride={teacher_stride} * student_steps={student_steps} "
+                f"!= teacher_steps={cfg.teacher_steps}. Pick (student_steps, "
+                "teacher_stride) so they multiply to teacher_steps."
+            )
+
+        self.student_steps = student_steps
+        self.teacher_stride = teacher_stride
+        self.mask_token_id = cfg.mask_token_id
+        self.eos_token_id = cfg.eos_token_id
+        self.max_response_len = cfg.max_response_len
+        self.top_k = cfg.top_k
+
+        # Flat index -> (shard_idx, idx_in_shard, sample_id).
+        self._sample_idx: list[tuple[int, int, int]] = []
+        for shard_idx, shard_info in enumerate(self.manifest.shards):
+            for j, sid in enumerate(shard_info.sample_ids):
+                if sample_id_filter is not None and sid not in sample_id_filter:
+                    continue
+                self._sample_idx.append((shard_idx, j, sid))
+
+        # Per-process lazy mmap'd shards.
+        self._shard_handles: dict[int, np.lib.npyio.NpzFile] = {}
+
+    # ------------------------------------------------------------------
+    # Convenience: split sample IDs train / val
+    # ------------------------------------------------------------------
+
+    def all_sample_ids(self) -> list[int]:
+        return [sid for _, _, sid in self._sample_idx]
+
+    @staticmethod
+    def split_sample_ids(
+        sample_ids: list[int],
+        val_fraction: float,
+        seed: int = 0,
+    ) -> tuple[set[int], set[int]]:
+        """Deterministic train/val split by sample id (not by position).
+
+        Last ``val_fraction`` of ids (after a fixed shuffle) become val.
+        Stable across runs given the same ``seed``.
+        """
+        if val_fraction <= 0:
+            return set(sample_ids), set()
+        rng = np.random.default_rng(seed)
+        ids = list(sample_ids)
+        rng.shuffle(ids)
+        n_val = max(1, int(round(len(ids) * val_fraction)))
+        val_ids = set(ids[-n_val:])
+        train_ids = set(ids[:-n_val])
+        return train_ids, val_ids
+
+    # ------------------------------------------------------------------
+    # Dataset interface
+    # ------------------------------------------------------------------
+
+    def __len__(self) -> int:
+        return len(self._sample_idx) * self.student_steps
+
+    def __getitem__(self, i: int) -> dict:
+        sample_global_idx, student_step = divmod(i, self.student_steps)
+        teacher_step = student_step * self.teacher_stride
+        shard_idx, idx_in_shard, sample_id = self._sample_idx[sample_global_idx]
+
+        shard = self._shard(shard_idx)
+
+        prompt_len = int(shard["prompt_lens"][idx_in_shard])
+        final_seq = np.asarray(shard["final_sequences"][idx_in_shard])  # [T_shard]
+
+        mask_packed = np.asarray(
+            shard["mask_state_packed"][idx_in_shard, teacher_step]
+        )
+        mask_at_step = unpack_mask_bits(mask_packed, length=self.max_response_len)
+
+        input_ids = reconstruct_input_at_step(
+            final_sequence=final_seq,
+            prompt_len=prompt_len,
+            mask_at_step=mask_at_step,
+            mask_token_id=self.mask_token_id,
+        )
+
+        # Teacher targets at this step. Cast bf16 -> fp32 here so the
+        # collator and loss never touch the uint16 view.
+        top_k_indices = np.asarray(
+            shard["top_k_indices"][idx_in_shard, teacher_step]
+        ).astype(np.int64, copy=False)
+        top_k_logprobs = uint16_bf16_to_fp32_numpy(
+            np.ascontiguousarray(shard["top_k_logprobs_bf16"][idx_in_shard, teacher_step])
+        )
+        neg_log_tail = uint16_bf16_to_fp32_numpy(
+            np.ascontiguousarray(
+                shard["neg_log_tail_mass_bf16"][idx_in_shard, teacher_step]
+            )
+        )
+
+        return {
+            "sample_id": int(sample_id),
+            "student_step": int(student_step),
+            "teacher_step": int(teacher_step),
+            "input_ids": input_ids,
+            "prompt_len": prompt_len,
+            "supervised_mask": mask_at_step,
+            "teacher_top_k_indices": top_k_indices,
+            "teacher_top_k_logprobs": top_k_logprobs,
+            "teacher_neg_log_tail": neg_log_tail,
+        }
+
+    def _shard(self, shard_idx: int) -> np.lib.npyio.NpzFile:
+        handle = self._shard_handles.get(shard_idx)
+        if handle is None:
+            path = self.cache_dir / self.manifest.shards[shard_idx].path
+            handle = np.load(path, mmap_mode="r", allow_pickle=False)
+            self._shard_handles[shard_idx] = handle
+        return handle
+
+
+# ---------------------------------------------------------------------------
+# Collator
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TDDistillCollator:
+    """Stacks ``TrajectoryCacheDataset`` items into a batch."""
+
+    pad_token_id: int
+
+    def __call__(self, examples: list[dict]) -> dict[str, torch.Tensor]:
+        # Cache shards may have different T_shard, so pad across the batch.
+        max_len = max(int(ex["input_ids"].shape[0]) for ex in examples)
+        B = len(examples)
+        L_resp = examples[0]["supervised_mask"].shape[0]
+        K = examples[0]["teacher_top_k_indices"].shape[-1]
+
+        input_ids = torch.full((B, max_len), self.pad_token_id, dtype=torch.long)
+        attention_mask = torch.zeros((B, max_len), dtype=torch.long)
+        prompt_lens = torch.zeros(B, dtype=torch.long)
+        supervised_mask = torch.zeros((B, L_resp), dtype=torch.bool)
+        teacher_top_k_indices = torch.zeros((B, L_resp, K), dtype=torch.long)
+        teacher_top_k_logprobs = torch.zeros((B, L_resp, K), dtype=torch.float32)
+        teacher_neg_log_tail = torch.zeros((B, L_resp), dtype=torch.float32)
+
+        for i, ex in enumerate(examples):
+            T = int(ex["input_ids"].shape[0])
+            input_ids[i, :T] = torch.from_numpy(np.ascontiguousarray(ex["input_ids"]))
+            valid_end = min(int(ex["prompt_len"]) + L_resp, max_len)
+            attention_mask[i, :valid_end] = 1
+            prompt_lens[i] = int(ex["prompt_len"])
+            supervised_mask[i] = torch.from_numpy(
+                np.ascontiguousarray(ex["supervised_mask"])
+            )
+            teacher_top_k_indices[i] = torch.from_numpy(
+                np.ascontiguousarray(ex["teacher_top_k_indices"])
+            )
+            teacher_top_k_logprobs[i] = torch.from_numpy(
+                np.ascontiguousarray(ex["teacher_top_k_logprobs"])
+            )
+            teacher_neg_log_tail[i] = torch.from_numpy(
+                np.ascontiguousarray(ex["teacher_neg_log_tail"])
+            )
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "prompt_lens": prompt_lens,
+            "supervised_mask": supervised_mask,
+            "teacher_top_k_indices": teacher_top_k_indices,
+            "teacher_top_k_logprobs": teacher_top_k_logprobs,
+            "teacher_neg_log_tail": teacher_neg_log_tail,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Trainer
+# ---------------------------------------------------------------------------
+
+
+class TDDistillationTrainer(transformers.Trainer):
+    """Plain HF Trainer with a coarse-KL ``compute_loss`` over cached teachers.
+
+    The student model can be any masked-LM-style HF model whose forward
+    returns ``.logits`` of shape ``[B, T, V]``. P0 uses vanilla
+    LLaDAModelLM. Phase 4 / 7 trainers will subclass this.
+    """
+
+    def compute_loss(
+        self,
+        model,
+        inputs: dict[str, torch.Tensor],
+        return_outputs: bool = False,
+        **kwargs,
+    ):
+        prompt_lens = inputs["prompt_lens"]  # [B]
+        supervised_mask = inputs["supervised_mask"]  # [B, L_resp]
+        teacher_top_k_indices = inputs["teacher_top_k_indices"]  # [B, L_resp, K]
+        teacher_top_k_logprobs = inputs["teacher_top_k_logprobs"]  # [B, L_resp, K] fp32
+        teacher_neg_log_tail = inputs["teacher_neg_log_tail"]  # [B, L_resp] fp32
+
+        outputs = model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+        )
+        logits = outputs.logits  # [B, T, V] in model dtype
+
+        B, L_resp = supervised_mask.shape
+        device = logits.device
+
+        # Absolute index of each response position in the [B, T] grid.
+        rel_pos = torch.arange(L_resp, device=device).unsqueeze(0)  # [1, L_resp]
+        abs_pos = prompt_lens.unsqueeze(1) + rel_pos  # [B, L_resp]
+
+        # Flat (b_idx, abs_pos) at supervised positions.
+        b_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, L_resp)
+        b_flat = b_idx[supervised_mask]  # [N_sup]
+        pos_flat = abs_pos[supervised_mask]  # [N_sup]
+
+        if b_flat.numel() == 0:
+            # No supervised position in this batch -- exceedingly rare
+            # (would need every (sample, step) to land on a fully-committed
+            # state). Return a 0 loss with a live grad path so the step
+            # still goes through.
+            zero = logits.sum() * 0.0
+            return (zero, outputs) if return_outputs else zero
+
+        student_logits_sup = logits[b_flat, pos_flat].float()  # [N_sup, V]
+        teacher_idx_sup = teacher_top_k_indices[supervised_mask].to(
+            device=device, non_blocking=True
+        )
+        teacher_lp_sup = teacher_top_k_logprobs[supervised_mask].to(
+            device=device, dtype=torch.float32, non_blocking=True
+        )
+        teacher_neg_log_tail_sup = teacher_neg_log_tail[supervised_mask].to(
+            device=device, dtype=torch.float32, non_blocking=True
+        )
+
+        loss = coarse_kl_with_tail(
+            student_logits=student_logits_sup,
+            teacher_top_k_indices=teacher_idx_sup,
+            teacher_top_k_logprobs=teacher_lp_sup,
+            teacher_neg_log_tail_mass=teacher_neg_log_tail_sup,
+        )
+
+        return (loss, outputs) if return_outputs else loss
