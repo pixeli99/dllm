@@ -185,20 +185,33 @@ class TrajectoryStepRecord:
 
 `L_supervised` = response positions only. Prompt slots are not stored.
 
-Sharded layout:
+Sharded layout (one *directory* per shard, one ``.npy`` per array key
+inside; `np.savez` packs into a zip and won't memory-map for random
+per-step access during training, so we don't use it):
 ```
 .cache/teacher_traj/openmath2-1k-256step/
-├── manifest.json     (shard list, sampler config hash, git commit hash)
-├── shard_0000.npz    (100 samples × 256 steps; structured arrays)
-├── shard_0001.npz
+├── manifest.json
+├── shard_0000/
+│   ├── sample_ids.npy
+│   ├── prompt_lens.npy
+│   ├── final_sequences.npy
+│   ├── mask_state_packed.npy
+│   ├── top_k_indices.npy
+│   ├── top_k_logprobs_bf16.npy
+│   ├── neg_log_tail_mass_bf16.npy
+│   ├── top1_conf_bf16.npy
+│   └── entropy_bf16.npy
+├── shard_0001/
+│   └── ...
 └── ...
 ```
 
 Public API:
 ```python
-def write_shard(path, samples: List[SampleTrajectory]): ...
-def open_shard(path) -> ShardReader: ...     # supports random (sample_id, step_idx) access
-def load_manifest(cache_dir) -> CacheManifest: ...
+def write_shard(path, shard: ShardData) -> None: ...
+def read_shard(path, mmap=True, materialize_fp32=True) -> ShardData: ...   # tests / audit
+def open_shard_arrays(path) -> dict[str, np.ndarray]: ...                  # training; np.memmap views
+def CacheManifest.load(cache_dir, strict_git=False) -> CacheManifest: ...
 ```
 
 ### 5.3 Cache builder
@@ -207,17 +220,21 @@ File: `dllm/tools/build_teacher_cache.py`.
 ```bash
 python -m dllm.tools.build_teacher_cache \
     --teacher_ckpt <path> \
-    --dataset <openmath2-500k cache> \
+    --dataset_path <openmath2-500k cache> \
     --num_samples 1000 \
     --teacher_steps 256 \
     --max_response_len 256 \
     --top_k 64 \
     --output_dir .cache/teacher_traj/openmath2-1k-256step \
     --shard_size 100 \
-    --num_workers 4
+    --micro_batch_size 4
 ```
 
-Determinism: each shard writes a per-shard `seed = hash(sample_id)`.
+Determinism comes from ``temperature=0`` + ``stochastic_transfer=False``
+hard-coded in :class:`DeterministicMDLMSampler`; no per-shard seed is
+needed (and none is recorded). What goes into the manifest is the
+sampler-config hash (``top_k``, ``teacher_steps``, ``tie_break_eps``, …)
+and the git commit at build time (audit metadata only).
 
 ### 5.4 Mini-cache pre-flight (cheap, mandatory)
 Before launching the full 1k build, run with `--num_samples 50`. Verify:
@@ -310,11 +327,18 @@ already in step-t top-10? Report mean inclusion at K_steps ∈ {2,4,8}.
 
 ### 7.4 Decision rule
 
+The cache is built on a fixed grid of ``teacher_steps=256`` and the
+training dataset indexes by ``(sample, student_step)`` with stride
+``teacher_steps / student_steps``. Hence ``student_steps`` must divide
+``teacher_steps``; pick from the divisor set ``{32, 64, 128, 256}``
+(``T_rec`` follows so the inner-loop budget per outer step is
+``teacher_steps / student_steps``).
+
 | K=4 skip-probe KL ratio | future-commit incl. @ K=4 | (student_steps, T_rec) |
 |---|---|---|
 | ≤ 1.5× K=1 self-KL | ≥ 0.7 | (64, 4) |
-| 1.5–3× | 0.4–0.7 | (86, 3) |
-| > 3× | < 0.4 | (128, 2) |
+| 1.5–3× | 0.4–0.7 | (128, 2) |
+| > 3× | < 0.4 | (128, 2) (still try, but expect P0.5 to flag low compressibility) |
 
 If K=8 also viable: (32, 8). Acceptance: `phase3_decision.json` written
 with the locked `(student_steps, T_rec)` and the underlying numbers.
@@ -462,19 +486,32 @@ Data-driven only. Two axes:
 ## 13. Numerical Hazards (do not skip)
 
 1. **Cache I/O bf16; KL computation fp32.** Every entry point that
-   reads cached `top64_logprobs` or `neg_log_tail_mass` must `cast`
-   to fp32 before any `exp` / `log` / sum. There are no exceptions.
-2. **Tail mass storage**: `neg_log_tail_mass = -log(1 - sum_top64)`.
+   reads cached `top_k_logprobs_bf16` or `neg_log_tail_mass_bf16` must
+   cast to fp32 before any `exp` / `log` / sum. ``coarse_kl_with_tail``
+   raises if it gets a non-fp32 student logits tensor; the dataset
+   does the cast in ``__getitem__`` so the collator and loss never see
+   the uint16 view.
+2. **Tail mass storage**: `neg_log_tail_mass = -log(1 - sum_top_k)`.
    Reverse: `tail_mass = exp(-neg_log_tail_mass)`. Underflow at very
    confident steps is acceptable -- KL contribution becomes 0.
-3. **Confidence sampler** runs in fp32. Tie-break eps must be applied
-   on masked positions only (prompt positions stay at -inf).
-4. **Coarse KL**: clamp `student_top64_mass` at `1 - 1e-6` before
+3. **Tie-break in fp64.** The deterministic sampler promotes confidence
+   to fp64 for the commit-selection ``topk`` and adds a per-position
+   ``-1e-12 * pos_idx`` offset. The eps is small enough that for
+   fp32-distinct confidences ordering is preserved (``eps * T`` stays
+   well below fp32 precision). The straight ``-1e-7 * pos`` shape from
+   an earlier draft is wrong: at T=1024 it perturbs by 1e-4, which
+   *does* reorder fp32-distinct positions.
+4. **Coarse KL**: clamp `student_top_k_mass` at `1 - 1e-6` before
    `log1p` -- otherwise NaN gradient at confident student.
-5. **Determinism stamp**: cache manifest stores `git_commit_hash`,
-   `sampler_config_hash`, `torch_version`, `cuda_version`. Loader
-   refuses to read a cache built from a different commit unless
-   `--allow_stale` is set.
+5. **Cache compatibility stamp**. Manifest records
+   ``sampler_config_hash`` (top_k, teacher_steps, tie_break_eps, …)
+   and ``git_commit_hash``. The hash that *determines* cache content
+   is the sampler hash; the git stamp is audit metadata.
+   ``CacheManifest.load`` warns on git drift and only raises when
+   ``strict_git=True``. The trainer config exposes ``--strict_git``
+   for runs that want hard pinning. There is no ``--allow_stale``;
+   that contract was removed because the default behaviour is now
+   already permissive.
 
 ---
 

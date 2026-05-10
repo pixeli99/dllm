@@ -6,7 +6,9 @@ from .mdlm_deterministic import (
     DeterministicMDLMSamplerConfig,
     TrajectorySamplerOutput,
     TrajectoryStep,
+    record_per_position_distribution,
     sampler_config_hash_payload,
+    select_top_k_commit_indices,
 )
 from .utils import add_gumbel_noise, get_num_transfer_tokens
 
@@ -22,7 +24,9 @@ __all__ = [
     "DeterministicMDLMSamplerConfig",
     "TrajectorySamplerOutput",
     "TrajectoryStep",
+    "record_per_position_distribution",
     "sampler_config_hash_payload",
+    "select_top_k_commit_indices",
     "add_gumbel_noise",
     "get_num_transfer_tokens",
 ]

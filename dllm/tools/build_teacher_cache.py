@@ -8,33 +8,27 @@ How to run on the cluster (Phase 1, full 1k cache)::
     srun -p $PARTITION --quotatype=$QUOTATYPE --gres=gpu:1 \
         --cpus-per-task=24 --time=24:00:00 \
         python /lustre/projects/polyullm/lipengxiang_tmp/dllm/dllm/tools/build_teacher_cache.py \
-            --teacher_ckpt /lustre/projects/polyullm/lipengxiang_tmp/dllm/.models/loop_belief/openmath2-baseline/checkpoint-final \
+            --teacher_ckpt /lustre/projects/polyullm/lipengxiang_tmp/dllm/.models/loop_belief/openmath2-v0-baseline/checkpoint-final \
             --dataset_path /lustre/projects/polyullm/lipengxiang_tmp/dllm/.data/sft/llada/openmath2-500k \
-            --dataset_split train \
             --num_samples 1000 \
-            --teacher_steps 256 \
-            --max_response_len 256 \
-            --top_k 64 \
-            --shard_size 100 \
-            --micro_batch_size 4 \
-            --output_dir /lustre/projects/polyullm/lipengxiang_tmp/dllm/.cache/teacher_traj/openmath2-1k-256step \
-            --max_prompt_len 768
+            --output_dir /lustre/projects/polyullm/lipengxiang_tmp/dllm/.cache/teacher_traj/openmath2-1k-256step
 
 How to do the mandatory mini-cache pre-flight (REENTRY_TD_SPEC.md §5.4)::
 
-    same as above but --num_samples 50 and --output_dir suffix mini
+    same as above but --num_samples 50, --shard_size 50,
+    a different --output_dir, and --audit.
 
 What this does:
 
 1. Loads the teacher SFT checkpoint and tokenizer.
-2. Loads a preprocessed SFT DatasetDict on disk and extracts prompts
-   (the prefix where ``labels == -100``).
+2. Loads a preprocessed SFT DatasetDict and extracts prompts (prefix
+   where ``labels == -100``).
 3. Selects ``num_samples`` prompts that fit ``max_prompt_len``.
 4. Groups them into shards of ``shard_size``; for each shard,
    micro-batches through the deterministic sampler.
-5. Writes one ``.npz`` per shard plus a ``manifest.json`` that pins the
-   git commit, sampler config hash, torch/cuda versions, and the
-   per-shard sample IDs.
+5. Writes one shard directory of per-key ``.npy`` files per shard plus
+   a ``manifest.json`` that pins the git commit (audit-only), sampler
+   config hash, torch / cuda versions, and per-shard sample IDs.
 """
 
 from __future__ import annotations
@@ -50,7 +44,6 @@ import numpy as np
 import torch
 from datasets import load_from_disk
 
-# Local imports
 import dllm  # registers custom configs/models  (per AGENTS.md: import dllm matters)
 from dllm.core.samplers.mdlm_deterministic import (
     DeterministicMDLMSampler,
@@ -62,10 +55,10 @@ from dllm.pipelines.llada_looped.cache_io import (
     ShardData,
     ShardInfo,
     TrajectoryCacheConfig,
+    _git_commit_hash,
     compute_sampler_config_hash,
     utcnow_iso,
     write_shard,
-    _git_commit_hash,
 )
 from dllm.utils import get_model, get_tokenizer
 
@@ -100,21 +93,20 @@ def parse_args() -> argparse.Namespace:
     # --- Sharding / runtime ---
     p.add_argument("--shard_size", type=int, default=100)
     p.add_argument("--micro_batch_size", type=int, default=4,
-                   help="How many prompts to forward at once. "
-                        "Determinism within a fixed micro_batch_size is bit-exact, but "
-                        "cross-batch-size determinism is not guaranteed (FlashAttention etc).")
-    p.add_argument("--seed_base", type=int, default=20260510)
+                   help="How many prompts to forward at once. Determinism "
+                        "within a fixed micro_batch_size is bit-exact, but "
+                        "cross-batch-size determinism is not guaranteed "
+                        "(FlashAttention etc).")
     p.add_argument("--dtype", type=str, default="bfloat16",
-                   choices=["bfloat16", "float16", "float32"])
+                   choices=["bfloat16", "float16", "float32"],
+                   help="Model load dtype (passed straight through to "
+                        "dllm.utils.get_model).")
     p.add_argument("--device", type=str, default="cuda",
                    help="Device for the teacher forward.")
 
     # --- Output ---
     p.add_argument("--output_dir", type=str, required=True)
     p.add_argument("--allow_overwrite", action="store_true")
-    p.add_argument("--no_chat_template", action="store_true",
-                   help="Don't validate that prompts look chat-template-formed. "
-                        "Useful for non-instruct datasets.")
 
     # --- Audit (mini-cache pre-flight) ---
     p.add_argument("--audit", action="store_true",
@@ -140,7 +132,7 @@ def _extract_prompt(row: dict) -> tuple[np.ndarray | None, int | None]:
         return None, None
     nonprompt = np.where(labels != -100)[0]
     if nonprompt.size == 0:
-        return None, None  # all prompt, no response to learn from
+        return None, None  # all prompt, no response
     prompt_end = int(nonprompt[0])
     if prompt_end == 0:
         return None, None  # no prompt
@@ -153,7 +145,6 @@ def select_samples(
     max_prompt_len: int,
     min_prompt_len: int,
 ) -> list[dict]:
-    """Walk the dataset in order, keep prompts that pass length filters."""
     samples: list[dict] = []
     n_seen = 0
     for i in range(len(ds_split)):
@@ -219,14 +210,13 @@ def build_shard(
 
         out = sampler.sample_with_trajectory(prompts, sampler_cfg)
 
-        seq_np = out.sequences.cpu().numpy()  # [B_micro, T_micro]
+        seq_np = out.sequences.cpu().numpy()
         for j, s in enumerate(batch):
             i = batch_start + j
             sample_ids[i] = s["sample_id"]
             prompt_lens[i] = out.prompt_lens[j]
             T_micro = seq_np.shape[1]
             final_sequences[i, :T_micro] = seq_np[j]
-            # Trailing positions stay as EOS.
 
             traj = out.trajectories[j]
             if len(traj) != num_steps:
@@ -277,10 +267,6 @@ def main() -> int:
             )
             return 2
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # ---- Resolve dtype ----
-    dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
-    dtype = dtype_map[args.dtype]
 
     # ---- Tokenizer ----
     print(f"[info] loading tokenizer from {args.teacher_ckpt}", flush=True)
@@ -339,7 +325,6 @@ def main() -> int:
         top_k=args.top_k,
         block_size=block_size if block_size is not None else args.max_response_len,
         shard_size=args.shard_size,
-        seed_base=args.seed_base,
         mask_token_id=int(tokenizer.mask_token_id),
         eos_token_id=int(tokenizer.eos_token_id),
         bos_token_id=int(tokenizer.bos_token_id) if tokenizer.bos_token_id is not None else -1,
@@ -375,7 +360,7 @@ def main() -> int:
         start = shard_idx * args.shard_size
         end = min(start + args.shard_size, args.num_samples)
         shard_samples = samples[start:end]
-        rel_path = f"shard_{shard_idx:04d}.npz"
+        rel_path = f"shard_{shard_idx:04d}"  # directory, not a file
         shard_path = output_dir / rel_path
 
         print(
@@ -396,17 +381,16 @@ def main() -> int:
         print(f"[info]   sampled in {t_sample:.1f}s", flush=True)
 
         t1 = time.time()
-        md5 = write_shard(shard_path, shard_data)
+        write_shard(shard_path, shard_data)
         t_write = time.time() - t1
-        size_mb = shard_path.stat().st_size / (1 << 20)
-        print(f"[info]   wrote {size_mb:.1f} MB in {t_write:.1f}s, md5={md5[:8]}", flush=True)
+        size_mb = sum(p.stat().st_size for p in shard_path.rglob("*.npy")) / (1 << 20)
+        print(f"[info]   wrote {size_mb:.1f} MB in {t_write:.1f}s", flush=True)
 
         manifest.shards.append(
             ShardInfo(
                 path=rel_path,
                 sample_ids=[int(s["sample_id"]) for s in shard_samples],
                 t_shard=t_shard,
-                md5=md5,
             )
         )
         manifest.save(output_dir)  # incremental save in case of crash
@@ -414,7 +398,6 @@ def main() -> int:
     elapsed = time.time() - t_global
     print(f"[info] done. {num_shards} shards in {elapsed:.1f}s", flush=True)
 
-    # ---- Audit pass (Phase 1 mini-cache requirement) ----
     if args.audit:
         ok = run_audit(
             output_dir=output_dir,
@@ -438,15 +421,8 @@ def run_audit(
     min_pass_frac: float,
     min_top_k_mass: float,
 ) -> bool:
-    """Audit: in >= min_pass_frac of supervised positions, top-K mass >= min_top_k_mass.
-
-    "Supervised" here means: response positions that were still masked
-    at the start of that step (these are what student loss touches).
-    """
-    from dllm.pipelines.llada_looped.cache_io import (
-        read_shard,
-        uint16_bf16_to_fp32_numpy,
-    )
+    """Audit: in >= min_pass_frac of supervised positions, top-K mass >= min_top_k_mass."""
+    from dllm.pipelines.llada_looped.cache_io import read_shard
 
     print(
         f"[audit] checking top-K mass >= {min_top_k_mass} on supervised positions, "
@@ -459,10 +435,8 @@ def run_audit(
     for shard_idx, shard_info in enumerate(manifest.shards):
         path = output_dir / shard_info.path
         shard = read_shard(path, mmap=True, materialize_fp32=True)
-        # Compute top-K mass = exp(top_k_logprobs).sum(axis=-1)
         top_k_mass = np.exp(shard.top_k_logprobs).sum(axis=-1)  # [B, num_steps, L_resp]
-        # Supervised positions = currently masked positions only
-        supervised = shard.mask_state  # [B, num_steps, L_resp] bool
+        supervised = shard.mask_state
         passes = (top_k_mass >= min_top_k_mass) & supervised
         pass_count += int(passes.sum())
         total_count += int(supervised.sum())

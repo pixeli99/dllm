@@ -38,6 +38,7 @@ from torch.utils.data import Dataset
 from dllm.core.trainers.td_losses import coarse_kl_with_tail
 from dllm.pipelines.llada_looped.cache_io import (
     CacheManifest,
+    open_shard_arrays,
     reconstruct_input_at_step,
     uint16_bf16_to_fp32_numpy,
     unpack_mask_bits,
@@ -53,15 +54,15 @@ from dllm.pipelines.llada_looped.cache_io import (
 class TDDistillConfig(transformers.TrainingArguments):
     """Adds cache + student-step settings on top of TrainingArguments.
 
-    P0 only needs the four fields below. Phase 4/7 will add T_rec and
-    per-step lambdas in their own subclass; do not pre-add them here.
+    P0 only needs the fields below. Phase 4/7 will add T_rec and per-step
+    lambdas in their own subclass; do not pre-add them here.
     """
 
     cache_dir: str = ""
     student_steps: int = 128
     teacher_stride: int = 0  # 0 means "auto = teacher_steps // student_steps"
     val_fraction: float = 0.0  # 0 disables held-out eval
-    allow_stale_cache: bool = False
+    strict_git: bool = False  # promote cache git-drift warnings to errors
 
 
 # ---------------------------------------------------------------------------
@@ -86,10 +87,10 @@ class TrajectoryCacheDataset(Dataset):
         student_steps: int,
         teacher_stride: int = 0,
         sample_id_filter: Optional[set[int]] = None,
-        allow_stale_cache: bool = False,
+        strict_git: bool = False,
     ):
         self.cache_dir = Path(cache_dir)
-        self.manifest = CacheManifest.load(self.cache_dir, allow_stale=allow_stale_cache)
+        self.manifest = CacheManifest.load(self.cache_dir, strict_git=strict_git)
         cfg = self.manifest.config
 
         if teacher_stride <= 0:
@@ -98,7 +99,9 @@ class TrajectoryCacheDataset(Dataset):
             raise ValueError(
                 f"teacher_stride={teacher_stride} * student_steps={student_steps} "
                 f"!= teacher_steps={cfg.teacher_steps}. Pick (student_steps, "
-                "teacher_stride) so they multiply to teacher_steps."
+                "teacher_stride) so they multiply to teacher_steps. The cache "
+                "is built with a fixed teacher_steps grid; valid student_steps "
+                "are the divisors of teacher_steps."
             )
 
         self.student_steps = student_steps
@@ -116,8 +119,10 @@ class TrajectoryCacheDataset(Dataset):
                     continue
                 self._sample_idx.append((shard_idx, j, sid))
 
-        # Per-process lazy mmap'd shards.
-        self._shard_handles: dict[int, np.lib.npyio.NpzFile] = {}
+        # Per-process lazy mmap'd shards. Each handle is a dict of
+        # ``np.memmap`` views; per-(sample, step) slicing only reads the
+        # touched pages from disk, not the full array.
+        self._shard_handles: dict[int, dict[str, np.ndarray]] = {}
 
     # ------------------------------------------------------------------
     # Convenience: split sample IDs train / val
@@ -202,11 +207,11 @@ class TrajectoryCacheDataset(Dataset):
             "teacher_neg_log_tail": neg_log_tail,
         }
 
-    def _shard(self, shard_idx: int) -> np.lib.npyio.NpzFile:
+    def _shard(self, shard_idx: int) -> dict[str, np.ndarray]:
         handle = self._shard_handles.get(shard_idx)
         if handle is None:
-            path = self.cache_dir / self.manifest.shards[shard_idx].path
-            handle = np.load(path, mmap_mode="r", allow_pickle=False)
+            shard_dir = self.cache_dir / self.manifest.shards[shard_idx].path
+            handle = open_shard_arrays(shard_dir)
             self._shard_handles[shard_idx] = handle
         return handle
 

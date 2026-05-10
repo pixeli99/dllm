@@ -11,29 +11,35 @@ How to run a quick demo (needs a tokenizer + model on disk)::
         config=DeterministicMDLMSamplerConfig(teacher_steps=8, max_response_len=8, top_k=4),
     )
 
-Why this exists separately from :mod:`dllm.core.samplers.mdlm`:
+This is intentionally a stand-alone sampler, not a subclass of
+:class:`dllm.core.samplers.mdlm.MDLMSampler`. The default sampler does
+its commit selection in the model's native dtype (typically bf16) and
+has no hook for "record teacher's belief before commit" -- so we'd be
+overriding most of its body anyway. The two modules share helpers
+(:func:`record_per_position_distribution` and
+:func:`select_top_k_commit_indices` are public so MDLMSampler can adopt
+them later if a deterministic mode there is wanted), but the sampler
+classes themselves are independent. Keep them in sync if you change
+the commit math.
 
-* The default :class:`MDLMSampler` runs confidence selection in the
-  model's dtype (typically bf16) and applies no tie-break, so two runs
-  on the same hardware produce different commits whenever ties happen
-  (very common at low entropy).
-* It also has no hook for "record what teacher believed before this
-  commit" -- which is exactly what trajectory distillation needs.
+Determinism rules (REENTRY_TD_SPEC.md §5.1):
 
-This sampler addresses both:
+1. softmax + max for confidence is run in fp32 so the per-position
+   ranking does not drift with the model's compute dtype.
+2. The actual top-K commit selection is promoted to fp64 and given a
+   ``-tie_break_eps * pos_idx`` offset so positions that are exactly
+   tied at fp32 are broken deterministically by lower index. The eps
+   is small enough (default 1e-12) that for fp32-distinct confidences
+   the original ranking is preserved (eps * T_max << fp32 precision).
+3. Temperature = 0 and stochastic_transfer = False are hard-coded; no
+   flags. Any randomness here would defeat the cache's reproducibility
+   contract.
 
-* fp32 softmax / fp32 confidence throughout the commit-selection path;
-* a per-position ``-eps * pos_idx`` tie-break that makes lower indices
-  win deterministically (matches REENTRY_TD_SPEC.md §5.1);
-* per-(sample, step) recording of top-K logprobs, tail mass,
-  argmax confidence, and entropy at response positions only.
+The model forward itself stays in its native dtype (bf16); only the
+softmax + topk path is promoted.
 
-The model forward itself stays in its native dtype (bf16). Only the
-softmax + topk + tie-break path is forced to fp32.
-
-Output shapes are committed at write time -- see
-:mod:`dllm.pipelines.llada_looped.cache_io` for how the trajectories
-get serialized into shards.
+Recorded outputs are serialized via
+:mod:`dllm.pipelines.llada_looped.cache_io`.
 """
 
 from __future__ import annotations
@@ -57,25 +63,24 @@ from dllm.core.samplers.utils import get_num_transfer_tokens
 
 @dataclass
 class DeterministicMDLMSamplerConfig(BaseSamplerConfig):
-    """Sampler config for trajectory cache builds.
-
-    Determinism requires temperature=0 and stochastic_transfer=False;
-    both are hard-coded inside the sampler -- no flags. ``tie_break_eps``
-    is exposed for testing the tie-break behaviour.
-    """
+    """Sampler config for trajectory cache builds."""
 
     teacher_steps: int = 256
     max_response_len: int = 256
     top_k: int = 64
     # Default: 1 block covering the whole response. The split-block path
-    # (block_size < max_response_len) still works but is currently not
-    # exercised by the cache builder.
+    # (block_size < max_response_len) still works but is not exercised
+    # by the cache builder today.
     block_size: int | None = None
     record_trajectory: bool = True
-    tie_break_eps: float = 1e-7
+    # Tie-break epsilon. fp64-side; default 1e-12 is below fp32 precision
+    # times any reasonable T (1e-12 * 1e6 = 1e-6 < fp32 eps ~6e-8 fails,
+    # actually no: 1e-12 * 1e6 = 1e-6 > 6e-8). For our T <= 4096 we get
+    # eps*T <= 4e-9, comfortably below fp32 distinct-value gaps.
+    tie_break_eps: float = 1e-12
 
-    # Hardcoded constants we want to surface for hashing the sampler
-    # config -- if any of these change, the cache must be rebuilt.
+    # Hardcoded constants surfaced here so the sampler-config hash sees
+    # them. If any of these change, cached trajectories are invalidated.
     _temperature: float = 0.0
     _stochastic_transfer: bool = False
     _remasking: str = "low_confidence"
@@ -96,10 +101,102 @@ class TrajectoryStep:
 
 @dataclass
 class TrajectorySamplerOutput(BaseSamplerOutput):
-    """Sampler output extended with the per-sample trajectory."""
-
     prompt_lens: list[int] = field(default_factory=list)
     trajectories: list[list[TrajectoryStep]] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers (shared with future deterministic-mode hooks
+# inside MDLMSampler if we ever add one)
+# ---------------------------------------------------------------------------
+
+
+def record_per_position_distribution(
+    response_logits: torch.Tensor,
+    mask_state: torch.Tensor,
+    top_k: int,
+) -> dict[str, np.ndarray]:
+    """Compute per-position teacher belief stats in fp32, return CPU numpy.
+
+    Args:
+        response_logits: ``[L_resp, V]``. Any model dtype; we cast to fp32.
+        mask_state: ``[L_resp]`` bool. Currently-masked response positions.
+        top_k: how many top tokens to record.
+
+    Returns a dict with the same fields a :class:`TrajectoryStep` carries
+    (minus ``step_idx``). Tail mass is stored as ``-log(1 - sum top_k)``,
+    floored to avoid ``log(0)`` at very confident positions.
+    """
+    response_logits = response_logits.float()  # [L_resp, V]
+    probs = response_logits.softmax(dim=-1)  # [L_resp, V] fp32
+    top_k_probs, top_k_indices = probs.topk(top_k, dim=-1)
+    top_k_sum = top_k_probs.sum(-1)
+
+    tail_mass = (1.0 - top_k_sum).clamp(min=1e-30)
+    neg_log_tail = -tail_mass.log()
+    top_k_logprobs = top_k_probs.clamp(min=1e-30).log()
+    top1_conf = top_k_probs[:, 0]
+    entropy = -(probs * probs.clamp(min=1e-30).log()).sum(-1)
+
+    return {
+        "mask_state": mask_state.detach().cpu().numpy().astype(bool),
+        "top_k_indices": top_k_indices.detach().cpu().numpy().astype(np.int32),
+        "top_k_logprobs": top_k_logprobs.detach().cpu().numpy().astype(np.float32),
+        "neg_log_tail_mass": neg_log_tail.detach().cpu().numpy().astype(np.float32),
+        "top1_conf": top1_conf.detach().cpu().numpy().astype(np.float32),
+        "entropy": entropy.detach().cpu().numpy().astype(np.float32),
+    }
+
+
+def select_top_k_commit_indices(
+    confidence_fp32: torch.Tensor,
+    selectable_mask: torch.Tensor,
+    num_unmask_per_sample: torch.Tensor,
+    tie_break_eps: float = 1e-12,
+) -> torch.Tensor:
+    """Pick which positions to commit at this step, deterministically.
+
+    The selection runs in fp64 with a per-position ``-eps * pos_idx``
+    offset so:
+      * fp32-distinct confidences keep their original order (the offset
+        magnitude is below fp32 precision over any T_max we expect);
+      * fp32-equal confidences are broken by index, lower wins.
+
+    Args:
+        confidence_fp32: ``[B, T]`` fp32 -- the max softmax prob per position.
+        selectable_mask: ``[B, T]`` bool -- True where the position is
+            both currently masked AND inside the active block window.
+        num_unmask_per_sample: ``[B]`` int -- how many positions to commit
+            for this sample at this step.
+        tie_break_eps: see config docstring.
+
+    Returns:
+        ``[B, T]`` bool -- True at the up-to-num_unmask highest-confidence
+        selectable positions per sample.
+    """
+    if confidence_fp32.dtype != torch.float32:
+        raise TypeError(
+            "confidence must be fp32 at the helper boundary; the sampler "
+            "casts model logits up before computing softmax."
+        )
+
+    B, T = confidence_fp32.shape
+    device = confidence_fp32.device
+
+    confidence = confidence_fp32.double()
+    neg_inf = torch.full_like(confidence, -float("inf"))
+    confidence = torch.where(selectable_mask, confidence, neg_inf)
+
+    tie_break = -tie_break_eps * torch.arange(T, device=device, dtype=torch.float64)
+    confidence = confidence + tie_break.unsqueeze(0)
+
+    transfer = torch.zeros((B, T), dtype=torch.bool, device=device)
+    for j in range(B):
+        k = int(num_unmask_per_sample[j].item())
+        if k > 0:
+            _, idx = torch.topk(confidence[j], k=k)
+            transfer[j, idx] = True
+    return transfer
 
 
 # ---------------------------------------------------------------------------
@@ -109,11 +206,7 @@ class TrajectorySamplerOutput(BaseSamplerOutput):
 
 @dataclass
 class DeterministicMDLMSampler(BaseSampler):
-    """Confidence-based MDLM sampler with deterministic ties + trajectory.
-
-    The model forward stays in its native dtype. Everything that affects
-    the commit decision (softmax, max, topk, tie-break) runs in fp32.
-    """
+    """Confidence-based MDLM sampler with deterministic ties + trajectory."""
 
     @torch.no_grad()
     def sample_with_trajectory(
@@ -122,10 +215,7 @@ class DeterministicMDLMSampler(BaseSampler):
         config: DeterministicMDLMSamplerConfig,
     ) -> TrajectorySamplerOutput:
         cfg = config
-        if cfg.block_size is None:
-            block_size = cfg.max_response_len
-        else:
-            block_size = cfg.block_size
+        block_size = cfg.block_size if cfg.block_size is not None else cfg.max_response_len
         assert 1 <= block_size <= cfg.max_response_len
         assert 1 <= cfg.teacher_steps
         assert 1 <= cfg.top_k
@@ -157,23 +247,30 @@ class DeterministicMDLMSampler(BaseSampler):
             valid_end = min(pl + cfg.max_response_len, T)
             attention_mask[i, :valid_end] = 1
 
-        # ---- Trajectory storage ----
         trajectories: list[list[TrajectoryStep]] = [[] for _ in range(B)]
 
-        # ---- Block scheduling ----
         num_blocks = math.ceil(cfg.max_response_len / block_size)
         steps_per_block = math.ceil(cfg.teacher_steps / num_blocks)
 
         global_step_idx = 0
+        prompt_lens_t = torch.tensor(prompt_lens, dtype=torch.long, device=device)
+        pos_t = torch.arange(T, device=device).unsqueeze(0)  # [1, T]
 
         for b_idx in range(num_blocks):
-            # Per-sample block-mask map.
+            block_start_per = prompt_lens_t + b_idx * block_size
+            block_end_per = torch.minimum(
+                prompt_lens_t + (b_idx + 1) * block_size,
+                prompt_lens_t + cfg.max_response_len,
+            )
+
+            # Per-sample block-mask map (positions within the block that
+            # are still mask tokens RIGHT NOW, before this block starts).
             block_mask_index = torch.zeros(
                 (B, block_size), dtype=torch.bool, device=device
             )
             for j in range(B):
-                start = prompt_lens[j] + b_idx * block_size
-                end = min(start + block_size, prompt_lens[j] + cfg.max_response_len, T)
+                start = int(block_start_per[j].item())
+                end = int(block_end_per[j].item())
                 if start < end:
                     width = end - start
                     block_mask_index[j, :width] = x[j, start:end] == mask_id
@@ -188,53 +285,42 @@ class DeterministicMDLMSampler(BaseSampler):
 
             for step_in_block in range(effective_steps):
                 # ===== Forward pass (model dtype) =====
-                logits = self.model(x, attention_mask=attention_mask).logits  # [B, T, V]
+                logits = self.model(x, attention_mask=attention_mask).logits
 
                 # ===== Record trajectory (fp32) =====
                 if cfg.record_trajectory:
-                    self._record_step(
-                        logits=logits,
-                        x=x,
-                        prompt_lens=prompt_lens,
-                        max_response_len=cfg.max_response_len,
-                        top_k=cfg.top_k,
-                        mask_id=mask_id,
-                        global_step_idx=global_step_idx,
-                        trajectories=trajectories,
-                    )
+                    for s in range(B):
+                        pl = prompt_lens[s]
+                        response_logits = logits[s, pl : pl + cfg.max_response_len]
+                        mask_state = x[s, pl : pl + cfg.max_response_len] == mask_id
+                        rec = record_per_position_distribution(
+                            response_logits=response_logits,
+                            mask_state=mask_state,
+                            top_k=cfg.top_k,
+                        )
+                        trajectories[s].append(
+                            TrajectoryStep(step_idx=global_step_idx, **rec)
+                        )
 
-                # ===== Compute commit decision (fp32) =====
-                # argmax can use logits in their native dtype -- ties at
-                # logit level are rare. Confidence (fp32) is what we use
-                # to pick which positions to commit.
-                x0 = logits.argmax(dim=-1)  # [B, T]
-
-                probs_fp32 = logits.float().softmax(dim=-1)  # [B, T, V] fp32
-                conf_full = probs_fp32.max(dim=-1).values  # [B, T] fp32
+                # ===== Compute commit (fp32 confidence -> fp64 + tie-break) =====
+                # argmax in model dtype is fine (logit ties are rare); the
+                # selection-vs-confidence ordering is what matters.
+                x0 = logits.argmax(dim=-1)
+                probs_fp32 = logits.float().softmax(dim=-1)
+                conf_fp32 = probs_fp32.max(dim=-1).values  # [B, T]
 
                 mask_index_full = x == mask_id
-                neg_inf = torch.full_like(conf_full, -float("inf"))
-                confidence = torch.where(mask_index_full, conf_full, neg_inf)
-
-                # Restrict to current block window per sample
-                for j in range(B):
-                    block_end = prompt_lens[j] + (b_idx + 1) * block_size
-                    confidence[j, : prompt_lens[j]] = -float("inf")
-                    confidence[j, block_end:] = -float("inf")
-
-                # Tie-break: prefer lower position index
-                tie_break = -cfg.tie_break_eps * torch.arange(
-                    T, device=device, dtype=torch.float32
+                in_block = (pos_t >= block_start_per.unsqueeze(1)) & (
+                    pos_t < block_end_per.unsqueeze(1)
                 )
-                confidence = confidence + tie_break.unsqueeze(0)
+                selectable = mask_index_full & in_block
 
-                # Per-sample top-K commit
-                transfer_index = torch.zeros_like(x, dtype=torch.bool, device=device)
-                for j in range(B):
-                    k = int(num_transfer_tokens[j, step_in_block].item())
-                    if k > 0:
-                        _, select_idx = torch.topk(confidence[j], k=k)
-                        transfer_index[j, select_idx] = True
+                transfer_index = select_top_k_commit_indices(
+                    confidence_fp32=conf_fp32,
+                    selectable_mask=selectable,
+                    num_unmask_per_sample=num_transfer_tokens[:, step_in_block],
+                    tie_break_eps=cfg.tie_break_eps,
+                )
 
                 x0 = torch.where(mask_index_full, x0, x)
                 x[transfer_index] = x0[transfer_index]
@@ -261,59 +347,6 @@ class DeterministicMDLMSampler(BaseSampler):
         )
 
     # ------------------------------------------------------------------
-    # Trajectory recording (broken out for clarity / testability)
-    # ------------------------------------------------------------------
-
-    def _record_step(
-        self,
-        logits: torch.Tensor,  # [B, T, V] in model dtype
-        x: torch.Tensor,  # [B, T]
-        prompt_lens: list[int],
-        max_response_len: int,
-        top_k: int,
-        mask_id: int,
-        global_step_idx: int,
-        trajectories: list[list[TrajectoryStep]],
-    ) -> None:
-        """Compute response-window stats in fp32 and append to ``trajectories``."""
-        B = logits.shape[0]
-
-        # Slice each sample's response window. Shapes differ if prompts
-        # have different lengths (response_window is L_resp wide for all,
-        # just at different offsets), so we loop here rather than gather.
-        for s in range(B):
-            pl = prompt_lens[s]
-            response_logits = logits[s, pl : pl + max_response_len].float()  # [L_resp, V]
-
-            probs = response_logits.softmax(dim=-1)  # [L_resp, V] fp32
-            top_k_probs, top_k_indices = probs.topk(top_k, dim=-1)  # [L_resp, K]
-            top_k_sum = top_k_probs.sum(-1)  # [L_resp]
-
-            # tail_mass = 1 - sum(top_K). Floor to 1e-30 so log doesn't blow up
-            # at very confident positions; downstream KL will see neg_log_tail
-            # near log(1e30) ~ 69, well within bf16 range.
-            tail_mass = (1.0 - top_k_sum).clamp(min=1e-30)
-            neg_log_tail = -tail_mass.log()  # [L_resp]
-
-            top_k_logprobs = top_k_probs.clamp(min=1e-30).log()  # [L_resp, K]
-            top1_conf = top_k_probs[:, 0]  # [L_resp]
-            entropy = -(probs * probs.clamp(min=1e-30).log()).sum(-1)  # [L_resp]
-
-            mask_state = x[s, pl : pl + max_response_len] == mask_id  # [L_resp] bool
-
-            trajectories[s].append(
-                TrajectoryStep(
-                    step_idx=global_step_idx,
-                    mask_state=mask_state.cpu().numpy().astype(bool),
-                    top_k_indices=top_k_indices.cpu().numpy().astype(np.int32),
-                    top_k_logprobs=top_k_logprobs.cpu().numpy().astype(np.float32),
-                    neg_log_tail_mass=neg_log_tail.cpu().numpy().astype(np.float32),
-                    top1_conf=top1_conf.cpu().numpy().astype(np.float32),
-                    entropy=entropy.cpu().numpy().astype(np.float32),
-                )
-            )
-
-    # ------------------------------------------------------------------
     # BaseSampler abstract method satisfaction
     # ------------------------------------------------------------------
 
@@ -324,7 +357,6 @@ class DeterministicMDLMSampler(BaseSampler):
         config: DeterministicMDLMSamplerConfig | None = None,
         **kwargs,
     ) -> BaseSamplerOutput:
-        """Convenience: run with trajectory recording off, return only sequences."""
         if config is None:
             config = DeterministicMDLMSamplerConfig()
         config.record_trajectory = False
@@ -347,8 +379,7 @@ class DeterministicMDLMSampler(BaseSampler):
 def sampler_config_hash_payload(cfg: DeterministicMDLMSamplerConfig) -> dict:
     """Pull out the determinism-relevant fields for hashing.
 
-    Anything that could change a commit decision belongs here. Anything
-    that's purely metadata (like ``record_trajectory``) does not.
+    Anything that could change a commit decision belongs here.
     """
     return {
         "teacher_steps": cfg.teacher_steps,

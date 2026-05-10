@@ -54,14 +54,14 @@ def _build_dataset(
     student_steps: int,
     teacher_stride: int,
     sample_id_filter,
-    allow_stale: bool,
+    strict_git: bool,
 ) -> TrajectoryCacheDataset:
     return TrajectoryCacheDataset(
         cache_dir=cache_dir,
         student_steps=student_steps,
         teacher_stride=teacher_stride,
         sample_id_filter=sample_id_filter,
-        allow_stale_cache=allow_stale,
+        strict_git=strict_git,
     )
 
 
@@ -87,7 +87,7 @@ def train():
             student_steps=training_args.student_steps,
             teacher_stride=training_args.teacher_stride,
             sample_id_filter=None,
-            allow_stale=training_args.allow_stale_cache,
+            strict_git=training_args.strict_git,
         )
         if training_args.val_fraction > 0:
             train_ids, val_ids = TrajectoryCacheDataset.split_sample_ids(
@@ -104,14 +104,14 @@ def train():
                 student_steps=training_args.student_steps,
                 teacher_stride=training_args.teacher_stride,
                 sample_id_filter=train_ids,
-                allow_stale=training_args.allow_stale_cache,
+                strict_git=training_args.strict_git,
             )
             val_ds = _build_dataset(
                 cache_dir=training_args.cache_dir,
                 student_steps=training_args.student_steps,
                 teacher_stride=training_args.teacher_stride,
                 sample_id_filter=val_ids,
-                allow_stale=training_args.allow_stale_cache,
+                strict_git=training_args.strict_git,
             )
         else:
             train_ds = full_ds

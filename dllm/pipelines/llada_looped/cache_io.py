@@ -8,23 +8,45 @@ Cache directory layout::
 
     .cache/teacher_traj/<name>/
     ├── manifest.json
-    ├── shard_0000.npz
-    ├── shard_0001.npz
+    ├── shard_0000/
+    │   ├── sample_ids.npy
+    │   ├── prompt_lens.npy
+    │   ├── final_sequences.npy
+    │   ├── mask_state_packed.npy
+    │   ├── top_k_indices.npy
+    │   ├── top_k_logprobs_bf16.npy
+    │   ├── neg_log_tail_mass_bf16.npy
+    │   ├── top1_conf_bf16.npy
+    │   └── entropy_bf16.npy
+    ├── shard_0001/
+    │   └── ...
     └── ...
 
-Each shard packs `shard_size` samples of teacher trajectory, with all
-per-step arrays in a uniform shape `[B, num_steps, max_response_len, ...]`.
+Why one ``.npy`` per array (not a single ``.npz``):
+
+* ``np.load(path.npz, mmap_mode='r')`` returns an ``NpzFile`` whose
+  ``__getitem__`` decompresses the *whole* array into memory the first
+  time you touch it. With per-step random access during training, the
+  ``top_k_logprobs_bf16`` array alone is ~800 MB / shard -- that's a
+  full read of the file on every cold lookup. ``np.load(path.npy,
+  mmap_mode='r')`` *does* return an ``np.memmap``, which is what we
+  want for random ``[sample_in_shard, step]`` slicing.
 
 Hard rules (mirrored from REENTRY_TD_SPEC.md §13):
 
 * bf16 fields are stored as uint16 views (numpy lacks a native bf16
   dtype). Any code that consumes them must cast to fp32 before any
-  ``exp`` / ``log`` / sum.
+  ``exp`` / ``log`` / sum. ``read_shard`` does this when
+  ``materialize_fp32=True``; ``open_shard_arrays`` does NOT, leaving
+  the cast for the per-step slice in the training collator.
 * Mask bits are stored bit-packed via ``np.packbits``; downstream code
   unpacks back to bool with the original ``L_resp`` length.
-* Manifest stamps git/sampler/torch/cuda versions; the reader refuses
-  to load a manifest produced by a different commit unless the caller
-  passes ``allow_stale=True``.
+* The manifest stamps git commit, sampler config hash, torch / cuda
+  versions. Cache content is determined by ``sampler_config_hash``;
+  git commit is stored only as audit metadata. ``CacheManifest.load``
+  emits a warning on git drift but does not raise (pass
+  ``strict_git=True`` to promote it). This is so a freshly-committed
+  trainer can still consume a cache built last week.
 """
 
 from __future__ import annotations
@@ -35,11 +57,13 @@ import hashlib
 import json
 import os
 import subprocess
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
+
 
 # ---------------------------------------------------------------------------
 # Public dataclasses
@@ -63,27 +87,29 @@ class TrajectoryCacheConfig:
     top_k: int
     block_size: int
     shard_size: int
-    seed_base: int
     mask_token_id: int
     eos_token_id: int
     bos_token_id: int
-    # tokenizer fingerprint (vocab size + name) -- guards against silent
-    # tokenizer changes between cache build and student training.
     vocab_size: int
     tokenizer_name_or_path: str
 
 
 @dataclass
 class ShardInfo:
+    """Per-shard metadata stored in the manifest.
+
+    ``path`` is a directory name relative to the cache root; the
+    directory holds one ``.npy`` per array key.
+    """
+
     path: str
     sample_ids: list[int]
     t_shard: int  # max prompt_len + max_response_len in this shard
-    md5: Optional[str] = None
 
 
 @dataclass
 class CacheManifest:
-    """The on-disk manifest. Stored as JSON next to the shards."""
+    """The on-disk manifest, stored as ``manifest.json`` next to the shards."""
 
     config: TrajectoryCacheConfig
     git_commit_hash: str
@@ -116,8 +142,15 @@ class CacheManifest:
     def load(
         cls,
         cache_dir: str | os.PathLike,
-        allow_stale: bool = False,
+        strict_git: bool = False,
     ) -> "CacheManifest":
+        """Load a manifest. Warns on git drift; passes ``strict_git=True`` to
+        promote that to an error.
+
+        Sampler-config / content compatibility is *not* checked here -- the
+        manifest's ``sampler_config_hash`` is recorded for audit. Callers
+        that want hard config compatibility should compare it themselves.
+        """
         cache_dir = Path(cache_dir)
         path = cache_dir / "manifest.json"
         with path.open("r") as f:
@@ -133,31 +166,36 @@ class CacheManifest:
             shards=[ShardInfo(**s) for s in payload["shards"]],
         )
 
-        if not allow_stale:
-            _check_manifest_freshness(manifest)
+        _check_git_drift(manifest, strict=strict_git)
         return manifest
 
-    def shard_path(self, cache_dir: str | os.PathLike, shard_idx: int) -> Path:
+    def shard_dir(self, cache_dir: str | os.PathLike, shard_idx: int) -> Path:
         return Path(cache_dir) / self.shards[shard_idx].path
 
 
-def _check_manifest_freshness(manifest: CacheManifest) -> None:
-    """Compare manifest's git commit to current HEAD; warn loudly on drift.
+def _check_git_drift(manifest: CacheManifest, strict: bool) -> None:
+    """Warn (or raise, if strict) when the current HEAD differs from the
+    commit that built the cache.
 
-    We do not raise -- training scripts should pass ``allow_stale=True``
-    explicitly when they accept stale caches. The check exists so a
-    silently-rebuilt cache cannot poison a downstream run.
+    Cache content is not bit-tied to git -- it is determined by the
+    sampler config + dataset + teacher checkpoint. The git stamp is
+    audit metadata. Promoting drift to an error is opt-in.
     """
     try:
         current_commit = _git_commit_hash()
     except Exception:
-        return  # not a git checkout, skip
+        return
     if current_commit and current_commit != manifest.git_commit_hash:
-        raise ValueError(
-            f"Cache was built at commit {manifest.git_commit_hash} but the "
-            f"current HEAD is {current_commit}. Pass allow_stale=True to "
-            "force load. (See REENTRY_TD_SPEC.md §13.)"
+        msg = (
+            f"Cache was built at git commit {manifest.git_commit_hash} but "
+            f"the current HEAD is {current_commit}. Cache content is "
+            "determined by the sampler config hash "
+            f"({manifest.sampler_config_hash}); git drift is informational."
         )
+        if strict:
+            raise ValueError(msg + " (strict_git=True; pass False to demote.)")
+        warnings.warn(msg + " Pass strict_git=True to promote to an error.",
+                      stacklevel=3)
 
 
 # ---------------------------------------------------------------------------
@@ -167,13 +205,12 @@ def _check_manifest_freshness(manifest: CacheManifest) -> None:
 
 @dataclass
 class ShardData:
-    """One shard, all arrays in their friendly numpy form (mask unpacked,
-    bf16 fields already cast to fp32).
+    """One shard, all arrays in their friendly numpy form.
 
     Used by the cache builder to assemble a shard before write, and by
-    the test roundtrip code. The training-time reader uses
-    :func:`open_shard_lazy` and avoids materializing fp32 versions of the
-    bulk arrays.
+    the test roundtrip code. Training-time random access goes through
+    :func:`open_shard_arrays` instead, to keep the bulk arrays as
+    memory-maps.
     """
 
     sample_ids: np.ndarray  # int64  [B]
@@ -206,14 +243,7 @@ def pack_mask_bits(mask: np.ndarray) -> np.ndarray:
 
 
 def unpack_mask_bits(packed: np.ndarray, length: int) -> np.ndarray:
-    """Inverse of :func:`pack_mask_bits`.
-
-    Args:
-        packed: uint8 array of shape [..., ceil(length / 8)].
-        length: original ``L_resp``.
-    Returns:
-        bool array of shape [..., length].
-    """
+    """Inverse of :func:`pack_mask_bits`."""
     if packed.dtype != np.uint8:
         raise TypeError(f"packed must be uint8, got {packed.dtype}")
     unpacked = np.unpackbits(packed, axis=-1, count=length, bitorder="big")
@@ -226,12 +256,7 @@ def unpack_mask_bits(packed: np.ndarray, length: int) -> np.ndarray:
 
 
 def torch_bf16_to_uint16_numpy(t) -> np.ndarray:
-    """Convert a torch.bfloat16 tensor to a numpy uint16 array (same bits).
-
-    Numpy has no native bf16, so we view the same memory as uint16. The
-    consumer must call :func:`uint16_numpy_to_torch_bf16` before any
-    arithmetic.
-    """
+    """Convert a torch.bfloat16 tensor to a numpy uint16 array (same bits)."""
     import torch
 
     if t.dtype != torch.bfloat16:
@@ -240,21 +265,25 @@ def torch_bf16_to_uint16_numpy(t) -> np.ndarray:
 
 
 def uint16_numpy_to_torch_bf16(arr: np.ndarray):
-    """Inverse of :func:`torch_bf16_to_uint16_numpy`."""
+    """Inverse of :func:`torch_bf16_to_uint16_numpy`.
+
+    Forces a writeable contiguous copy because ``torch.from_numpy`` warns
+    on non-writable buffers (which is what mmap'd ``.npy`` files give us).
+    The copy is small -- typically a per-step slice of a few KB.
+    """
     import torch
 
     if arr.dtype != np.uint16:
         raise TypeError(f"expected uint16 array, got {arr.dtype}")
-    t = torch.from_numpy(np.ascontiguousarray(arr))
+    arr = np.ascontiguousarray(arr)
+    if not arr.flags.writeable:
+        arr = arr.copy()
+    t = torch.from_numpy(arr)
     return t.view(torch.bfloat16)
 
 
 def fp32_numpy_to_uint16_bf16(arr: np.ndarray) -> np.ndarray:
-    """fp32 numpy -> uint16-view of bf16 numpy. CPU only.
-
-    This goes through torch because numpy lacks a bf16 dtype. Acceptable
-    overhead for cache writes -- happens once per shard.
-    """
+    """fp32 numpy -> uint16-view of bf16 numpy. CPU only."""
     import torch
 
     if arr.dtype != np.float32:
@@ -269,7 +298,7 @@ def uint16_bf16_to_fp32_numpy(arr: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Shard write / read
+# Shard write / read / mmap-open
 # ---------------------------------------------------------------------------
 
 
@@ -286,17 +315,20 @@ _ARRAY_KEYS = (
 )
 
 
-def write_shard(path: str | os.PathLike, shard: ShardData) -> str:
-    """Serialize a :class:`ShardData` to an uncompressed npz file.
+def write_shard(path: str | os.PathLike, shard: ShardData) -> None:
+    """Serialize a :class:`ShardData` as a directory of per-key ``.npy`` files.
 
-    Returns the md5 of the written file (for the manifest).
+    Why a directory: we need real ``np.memmap`` random access during
+    training. ``np.savez`` packs everything into a zip and forces a full
+    read on first lookup; that's not viable for an 800 MB
+    ``top_k_logprobs_bf16`` array touched once per training example.
     """
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.mkdir(parents=True, exist_ok=True)
 
     _validate_shard_shapes(shard)
 
-    payload = {
+    arrays = {
         "sample_ids": shard.sample_ids.astype(np.int64, copy=False),
         "prompt_lens": shard.prompt_lens.astype(np.int32, copy=False),
         "final_sequences": shard.final_sequences.astype(np.int64, copy=False),
@@ -316,15 +348,8 @@ def write_shard(path: str | os.PathLike, shard: ShardData) -> str:
         ),
     }
 
-    # Uncompressed -- mmap_mode='r' requires this.
-    np.savez(path, **payload)
-
-    # Recompute file md5 for manifest integrity.
-    md5 = hashlib.md5()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            md5.update(chunk)
-    return md5.hexdigest()
+    for name, arr in arrays.items():
+        np.save(path / f"{name}.npy", arr, allow_pickle=False)
 
 
 def read_shard(
@@ -332,49 +357,74 @@ def read_shard(
     mmap: bool = True,
     materialize_fp32: bool = True,
 ) -> ShardData:
-    """Read a shard back into :class:`ShardData`.
+    """Read a shard back into a fully-materialized :class:`ShardData`.
+
+    Use this for tests / audits. For training, prefer
+    :func:`open_shard_arrays` which keeps every array as a memory-map
+    and lets the collator slice + cast per ``(sample, step)``.
 
     Args:
-        path: path to the .npz file.
-        mmap: if True, use ``np.load(mmap_mode='r')`` for lazy access.
-        materialize_fp32: if True, convert all bf16-as-uint16 fields to
-            fp32 (convenient but allocates). If False, stash the uint16
-            arrays directly in the corresponding fp32 fields -- callers
-            doing per-step access should set this False and call
-            :func:`uint16_bf16_to_fp32_numpy` per slice.
+        path: shard directory.
+        mmap: if True, the underlying ``.npy`` files are opened as
+            memory-maps; the returned arrays are still
+            ``np.ndarray``-shaped views. Set False to force eager loads.
+        materialize_fp32: convert the bf16-as-uint16 fields to fp32.
     """
+    path = Path(path)
     mode = "r" if mmap else None
-    data = np.load(path, mmap_mode=mode, allow_pickle=False)
 
-    mask_state_packed = np.asarray(data["mask_state_packed"])
-    L_resp = data["top_k_indices"].shape[2]
+    def _load(name: str) -> np.ndarray:
+        return np.load(path / f"{name}.npy", mmap_mode=mode, allow_pickle=False)
+
+    sample_ids = np.asarray(_load("sample_ids"))
+    prompt_lens = np.asarray(_load("prompt_lens"))
+    final_sequences = np.asarray(_load("final_sequences"))
+    mask_state_packed = np.asarray(_load("mask_state_packed"))
+    top_k_indices = np.asarray(_load("top_k_indices"))
+
+    L_resp = int(top_k_indices.shape[2])
     mask_state = unpack_mask_bits(mask_state_packed, length=L_resp)
 
     if materialize_fp32:
-        top_k_logprobs = uint16_bf16_to_fp32_numpy(np.asarray(data["top_k_logprobs_bf16"]))
+        top_k_logprobs = uint16_bf16_to_fp32_numpy(np.asarray(_load("top_k_logprobs_bf16")))
         neg_log_tail = uint16_bf16_to_fp32_numpy(
-            np.asarray(data["neg_log_tail_mass_bf16"])
+            np.asarray(_load("neg_log_tail_mass_bf16"))
         )
-        top1_conf = uint16_bf16_to_fp32_numpy(np.asarray(data["top1_conf_bf16"]))
-        entropy = uint16_bf16_to_fp32_numpy(np.asarray(data["entropy_bf16"]))
+        top1_conf = uint16_bf16_to_fp32_numpy(np.asarray(_load("top1_conf_bf16")))
+        entropy = uint16_bf16_to_fp32_numpy(np.asarray(_load("entropy_bf16")))
     else:
-        # Caller is responsible for casting per slice.
-        top_k_logprobs = np.asarray(data["top_k_logprobs_bf16"])
-        neg_log_tail = np.asarray(data["neg_log_tail_mass_bf16"])
-        top1_conf = np.asarray(data["top1_conf_bf16"])
-        entropy = np.asarray(data["entropy_bf16"])
+        top_k_logprobs = np.asarray(_load("top_k_logprobs_bf16"))
+        neg_log_tail = np.asarray(_load("neg_log_tail_mass_bf16"))
+        top1_conf = np.asarray(_load("top1_conf_bf16"))
+        entropy = np.asarray(_load("entropy_bf16"))
 
     return ShardData(
-        sample_ids=np.asarray(data["sample_ids"]),
-        prompt_lens=np.asarray(data["prompt_lens"]),
-        final_sequences=np.asarray(data["final_sequences"]),
+        sample_ids=sample_ids,
+        prompt_lens=prompt_lens,
+        final_sequences=final_sequences,
         mask_state=mask_state,
-        top_k_indices=np.asarray(data["top_k_indices"]),
+        top_k_indices=top_k_indices,
         top_k_logprobs=top_k_logprobs,
         neg_log_tail_mass=neg_log_tail,
         top1_conf=top1_conf,
         entropy=entropy,
     )
+
+
+def open_shard_arrays(path: str | os.PathLike) -> dict[str, np.ndarray]:
+    """Return a dict of memory-mapped arrays for one shard.
+
+    The training collator should hold one of these per shard and slice
+    by ``[sample_in_shard, step]`` to read just the needed pages. bf16
+    fields are returned as uint16 views; the collator must call
+    :func:`uint16_bf16_to_fp32_numpy` (or the per-element equivalent)
+    before any arithmetic.
+    """
+    path = Path(path)
+    out: dict[str, np.ndarray] = {}
+    for key in _ARRAY_KEYS:
+        out[key] = np.load(path / f"{key}.npy", mmap_mode="r", allow_pickle=False)
+    return out
 
 
 def _validate_shard_shapes(shard: ShardData) -> None:
@@ -406,21 +456,7 @@ def reconstruct_input_at_step(
     mask_token_id: int,
     response_len: int | None = None,
 ) -> np.ndarray:
-    """Build the noised input that the teacher saw at the start of a step.
-
-    Args:
-        final_sequence: int64 [T] -- the fully-decoded canvas.
-        prompt_len: number of prompt tokens (response begins at this index).
-        mask_at_step: bool [L_resp] -- True where this step had a mask.
-        mask_token_id: id of the mask token.
-        response_len: defaults to ``mask_at_step.shape[0]``; can be smaller
-            if you want to slice off trailing padding (the model still
-            sees those positions, just with EOS, so the default is fine
-            in practice).
-
-    Returns:
-        int64 [T] -- the input the student should see for this step.
-    """
+    """Build the noised input that the teacher saw at the start of a step."""
     if response_len is None:
         response_len = mask_at_step.shape[0]
     out = final_sequence.copy()
@@ -437,19 +473,11 @@ def reconstruct_input_at_step(
 
 
 def compute_sampler_config_hash(payload: dict[str, Any]) -> str:
-    """Hash sampler-relevant config so manifest readers can detect drift.
-
-    Pass in only the fields that affect sampler determinism (e.g.
-    ``teacher_steps``, ``top_k``, ``block_size``, ``temperature``,
-    ``stochastic_transfer``, ``seed_base``). The hash is used as the
-    cache's reproducibility stamp.
-    """
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
 def _git_commit_hash() -> Optional[str]:
-    """Resolve the current git HEAD short hash, or None if not a checkout."""
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -475,12 +503,7 @@ def utcnow_iso() -> str:
 
 
 def _sanity() -> None:
-    """Tiny round-trip check; runnable without a GPU.
-
-    Builds a fake 2-sample shard, writes, reads, asserts byte/pattern
-    equality on bool/int fields and bf16-precision equality on numerical
-    fields.
-    """
+    """Tiny round-trip check; runnable without a GPU."""
     rng = np.random.default_rng(0)
     B, num_steps, L_resp, K = 2, 4, 8, 16
     T_shard = 10 + L_resp
@@ -502,23 +525,24 @@ def _sanity() -> None:
     import tempfile
 
     with tempfile.TemporaryDirectory() as td:
-        path = os.path.join(td, "shard.npz")
-        write_shard(path, shard)
-        round_tripped = read_shard(path, mmap=False, materialize_fp32=True)
+        shard_dir = os.path.join(td, "shard_0000")
+        write_shard(shard_dir, shard)
+        round_tripped = read_shard(shard_dir, mmap=True, materialize_fp32=True)
 
-    # Exact equality for int / bool fields.
+        # Also exercise the mmap-open path used by training.
+        mm = open_shard_arrays(shard_dir)
+        # Slicing a memmap should work without loading the whole array.
+        slice_uint16 = mm["top_k_logprobs_bf16"][0, 0]  # [L_resp, K] uint16
+        assert slice_uint16.shape == (L_resp, K)
+
     assert np.array_equal(shard.sample_ids, round_tripped.sample_ids)
     assert np.array_equal(shard.prompt_lens, round_tripped.prompt_lens)
     assert np.array_equal(shard.final_sequences, round_tripped.final_sequences)
     assert np.array_equal(shard.mask_state, round_tripped.mask_state)
     assert np.array_equal(shard.top_k_indices, round_tripped.top_k_indices)
-
-    # bf16 precision -- typical relative error is < 1/256 = 0.39%.
     for name in ("top_k_logprobs", "neg_log_tail_mass", "top1_conf", "entropy"):
         a = getattr(shard, name)
         b = getattr(round_tripped, name)
-        # Compare in fp32. bf16 has 7-bit mantissa, so worst-case relative
-        # error ~ 2^-7 ~ 0.78%. Use 1% tolerance with a 1e-3 floor.
         np.testing.assert_allclose(a, b, rtol=1e-2, atol=1e-3, err_msg=name)
 
     print("cache_io._sanity OK: shard round-trip preserves all fields within bf16 precision")
