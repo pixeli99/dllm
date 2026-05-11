@@ -229,6 +229,21 @@ def test_split_sample_ids_zero_fraction_returns_empty_val():
     assert val == set()
 
 
+def test_td_distill_config_disables_remove_unused_columns():
+    """HF Trainer's ``remove_unused_columns=True`` default would strip our
+    distillation target columns from the batch before the collator runs;
+    the collator would then KeyError on the first batch. The TDDistill
+    default must keep that override.
+    """
+    from dllm.core.trainers.td_distill import TDDistillConfig
+
+    cfg = TDDistillConfig(output_dir="/tmp/_does_not_matter")
+    assert cfg.remove_unused_columns is False, (
+        "TDDistillConfig must default remove_unused_columns=False so the "
+        "collator sees supervised_mask / teacher_top_k_* / prompt_lens."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Collator
 # ---------------------------------------------------------------------------

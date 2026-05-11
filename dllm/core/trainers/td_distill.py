@@ -65,6 +65,15 @@ class TDDistillConfig(transformers.TrainingArguments):
     val_fraction: float = 0.0  # 0 disables held-out eval
     strict_git: bool = False  # promote cache git-drift warnings to errors
 
+    # HF Trainer strips dataset columns that don't match model.forward's
+    # signature when remove_unused_columns is True (the default). Our
+    # batch carries distillation targets (supervised_mask,
+    # teacher_top_k_*, prompt_lens) that the LLaDA student does NOT
+    # consume in forward -- compute_loss consumes them. Turning this off
+    # is mandatory; otherwise the collator gets stripped dicts and
+    # KeyErrors on the first batch.
+    remove_unused_columns: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Cache-backed dataset
