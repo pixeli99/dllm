@@ -184,12 +184,108 @@ def test_dataset_len_and_item_shapes():
 
 
 def test_dataset_index_to_step_mapping():
+    """input_teacher_step = student_step * stride; target_teacher_step =
+    input + stride - 1 (the progressive-distillation shift)."""
     with tempfile.TemporaryDirectory() as td:
         _build_fake_cache(td, num_samples=2, teacher_steps=8, max_response_len=4, top_k=4)
         ds = _quiet_dataset(td, student_steps=4, teacher_stride=2)
         for i in range(len(ds)):
             item = ds[i]
-            assert item["student_step"] * 2 == item["teacher_step"]
+            assert item["input_teacher_step"] == item["student_step"] * 2
+            assert item["target_teacher_step"] == item["input_teacher_step"] + 1
+
+
+def test_dataset_target_is_shifted_from_input():
+    """Progressive-distillation target step is one less than the next
+    student step's input step. With teacher_steps=8 and stride=2:
+      student_step 0 -> input 0, target 1
+      student_step 1 -> input 2, target 3
+      ...
+      student_step 3 -> input 6, target 7  (last valid teacher step)
+    Same-step (input == target) would make the loss zero on a
+    student initialised from the teacher; the shift is what gives the
+    student a non-trivial training signal.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        _build_fake_cache(td, num_samples=1, shard_size=1,
+                          teacher_steps=8, max_response_len=4, top_k=4)
+        ds = _quiet_dataset(td, student_steps=4, teacher_stride=2)
+        seen = set()
+        for i in range(len(ds)):
+            item = ds[i]
+            seen.add((item["student_step"], item["input_teacher_step"],
+                      item["target_teacher_step"]))
+        assert seen == {(0, 0, 1), (1, 2, 3), (2, 4, 5), (3, 6, 7)}
+
+
+def test_dataset_target_uses_target_step_top_k_not_input_step():
+    """Confirm the cache slice for the target distribution comes from
+    target_teacher_step, not input_teacher_step.
+
+    Build a cache where top_k_indices at step t = constant t-id, so we
+    can read back which step's indices the dataset returned.
+    """
+    import numpy as np
+    rng = np.random.default_rng(0)
+    teacher_steps = 8
+    max_response_len = 4
+    top_k = 4
+    vocab_size = 50
+    B = 1
+    shard_size = 1
+
+    cfg = TrajectoryCacheConfig(
+        teacher_model_path="/fake/teacher", dataset_path="/fake/data",
+        dataset_split="train", num_samples=B, teacher_steps=teacher_steps,
+        max_response_len=max_response_len, top_k=top_k,
+        block_size=max_response_len, shard_size=shard_size,
+        mask_token_id=vocab_size - 1, eos_token_id=vocab_size - 2,
+        bos_token_id=vocab_size - 3, vocab_size=vocab_size,
+        tokenizer_name_or_path="/fake/teacher",
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        # Distinct top_k_indices per teacher step: position 0 holds step idx.
+        top_k_indices = np.zeros((B, teacher_steps, max_response_len, top_k), dtype=np.int32)
+        for t in range(teacher_steps):
+            top_k_indices[:, t, :, 0] = 100 + t  # easy to identify
+        shard_data = ShardData(
+            sample_ids=np.array([0], dtype=np.int64),
+            prompt_lens=np.array([2], dtype=np.int32),
+            final_sequences=rng.integers(0, 30, size=(B, 6), dtype=np.int64),
+            mask_state=np.ones((B, teacher_steps, max_response_len), dtype=bool),
+            top_k_indices=top_k_indices,
+            top_k_logprobs=np.full((B, teacher_steps, max_response_len, top_k), -1.0, dtype=np.float32),
+            neg_log_tail_mass=np.full((B, teacher_steps, max_response_len), 1.0, dtype=np.float32),
+            top1_conf=np.full((B, teacher_steps, max_response_len), 0.5, dtype=np.float32),
+            entropy=np.full((B, teacher_steps, max_response_len), 1.0, dtype=np.float32),
+        )
+        write_shard(os.path.join(td, "shard_0000"), shard_data)
+        manifest = CacheManifest(
+            config=cfg, git_commit_hash="fake",
+            sampler_config_hash=compute_sampler_config_hash({"fake": True}),
+            torch_version=torch.__version__, cuda_version=None,
+            created_at=utcnow_iso(),
+            shards=[ShardInfo(path="shard_0000", sample_ids=[0], t_shard=6)],
+        )
+        manifest.save(td)
+
+        ds = _quiet_dataset(td, student_steps=4, teacher_stride=2)
+
+        # student_step 0 -> input 0, target 1. The teacher indices we
+        # see should be from step 1, i.e., value 101.
+        item0 = ds[0]
+        assert item0["input_teacher_step"] == 0
+        assert item0["target_teacher_step"] == 1
+        assert int(item0["teacher_top_k_indices"][0, 0]) == 101, (
+            f"expected target step 1 (id 101), got "
+            f"{int(item0['teacher_top_k_indices'][0, 0])}"
+        )
+
+        # student_step 3 -> input 6, target 7.
+        item3 = ds[3]
+        assert item3["target_teacher_step"] == 7
+        assert int(item3["teacher_top_k_indices"][0, 0]) == 107
 
 
 def test_dataset_stride_mismatch_raises():

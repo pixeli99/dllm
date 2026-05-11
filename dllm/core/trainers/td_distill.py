@@ -187,8 +187,43 @@ class TrajectoryCacheDataset(Dataset):
         return len(self._sample_idx) * self.student_steps
 
     def __getitem__(self, i: int) -> dict:
+        """One progressive-distillation example.
+
+        ``student_step`` -> two teacher steps:
+
+        * ``input_teacher_step  = student_step * stride``: which mask state
+          the student sees as input (so the student is told "you are at
+          this point in the trajectory").
+        * ``target_teacher_step = input_teacher_step + stride - 1``: which
+          teacher distribution the student is supervised against.
+
+        The +stride-1 shift is the heart of progressive distillation.
+        Same-step targets (input == target) make the loss ~0 because the
+        student is initialised from the teacher checkpoint, so its
+        forward IS teacher's forward -- no training signal. Shifted
+        targets ask the student to predict, in one forward at M_input,
+        teacher's distribution after committing stride-1 more positions.
+        That distribution is sharp at the already-committed positions
+        and concentrated at the next position teacher would commit, so
+        the student's top-stride confidence ends up exactly at the
+        stride positions teacher commits over the corresponding stride
+        steps. At inference, the student's stride commits per step then
+        match teacher's stride commits.
+
+        Supervised positions are masked-at-INPUT (which is what the
+        student sees and must predict). For positions that teacher
+        committed between input and target, teacher's recorded
+        distribution at target is sharp at the committed token --
+        student learns to commit. For positions still masked at target,
+        student learns teacher's refined mid-trajectory belief.
+
+        Edge case bookkeeping: with input = (S-1)*stride and target =
+        input + stride - 1, target is at most S*stride - 1 =
+        teacher_steps - 1, so the last student step is always valid.
+        """
         sample_global_idx, student_step = divmod(i, self.student_steps)
-        teacher_step = student_step * self.teacher_stride
+        input_teacher_step = student_step * self.teacher_stride
+        target_teacher_step = input_teacher_step + self.teacher_stride - 1
         shard_idx, idx_in_shard, sample_id = self._sample_idx[sample_global_idx]
 
         shard = self._shard(shard_idx)
@@ -196,39 +231,45 @@ class TrajectoryCacheDataset(Dataset):
         prompt_len = int(shard["prompt_lens"][idx_in_shard])
         final_seq = np.asarray(shard["final_sequences"][idx_in_shard])  # [T_shard]
 
+        # Input: mask state at input_teacher_step.
         mask_packed = np.asarray(
-            shard["mask_state_packed"][idx_in_shard, teacher_step]
+            shard["mask_state_packed"][idx_in_shard, input_teacher_step]
         )
-        mask_at_step = unpack_mask_bits(mask_packed, length=self.max_response_len)
+        mask_at_input = unpack_mask_bits(mask_packed, length=self.max_response_len)
 
         input_ids = reconstruct_input_at_step(
             final_sequence=final_seq,
             prompt_len=prompt_len,
-            mask_at_step=mask_at_step,
+            mask_at_step=mask_at_input,
             mask_token_id=self.mask_token_id,
         )
 
-        # Teacher targets at this step. Cast bf16 -> fp32 here so the
-        # collator and loss never touch the uint16 view.
+        # Target: teacher's distribution at target_teacher_step. Cast bf16
+        # -> fp32 here so the collator and loss never touch the uint16 view.
         top_k_indices = np.asarray(
-            shard["top_k_indices"][idx_in_shard, teacher_step]
+            shard["top_k_indices"][idx_in_shard, target_teacher_step]
         ).astype(np.int64, copy=False)
         top_k_logprobs = uint16_bf16_to_fp32_numpy(
-            np.ascontiguousarray(shard["top_k_logprobs_bf16"][idx_in_shard, teacher_step])
+            np.ascontiguousarray(
+                shard["top_k_logprobs_bf16"][idx_in_shard, target_teacher_step]
+            )
         )
         neg_log_tail = uint16_bf16_to_fp32_numpy(
             np.ascontiguousarray(
-                shard["neg_log_tail_mass_bf16"][idx_in_shard, teacher_step]
+                shard["neg_log_tail_mass_bf16"][idx_in_shard, target_teacher_step]
             )
         )
 
         return {
             "sample_id": int(sample_id),
             "student_step": int(student_step),
-            "teacher_step": int(teacher_step),
+            "input_teacher_step": int(input_teacher_step),
+            "target_teacher_step": int(target_teacher_step),
             "input_ids": input_ids,
             "prompt_len": prompt_len,
-            "supervised_mask": mask_at_step,
+            # Supervise positions still masked at input -- that's what the
+            # student must predict.
+            "supervised_mask": mask_at_input,
             "teacher_top_k_indices": top_k_indices,
             "teacher_top_k_logprobs": top_k_logprobs,
             "teacher_neg_log_tail": neg_log_tail,
