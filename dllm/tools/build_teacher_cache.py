@@ -1,34 +1,40 @@
 """Build a teacher trajectory cache for ReEntry-TD distillation.
 
-How to run on the cluster (Phase 1, full 1k cache)::
+Single GPU::
 
-    source ~/.zshrc
-    conda activate ~/miniconda3/envs/dllm
-    cd /lustre/projects/polyullm/lipengxiang_tmp/dllm
-    srun -p $PARTITION --quotatype=$QUOTATYPE --gres=gpu:1 \
-        --cpus-per-task=24 --time=24:00:00 \
-        python /lustre/projects/polyullm/lipengxiang_tmp/dllm/dllm/tools/build_teacher_cache.py \
-            --teacher_ckpt /lustre/projects/polyullm/lipengxiang_tmp/dllm/.models/loop_belief/openmath2-v0-baseline/checkpoint-final \
-            --dataset_path /lustre/projects/polyullm/lipengxiang_tmp/dllm/.data/sft/llada/openmath2-500k \
-            --num_samples 1000 \
-            --output_dir /lustre/projects/polyullm/lipengxiang_tmp/dllm/.cache/teacher_traj/openmath2-1k-256step
+    python -m dllm.tools.build_teacher_cache \\
+        --teacher_ckpt /path/to/teacher \\
+        --dataset_path .data/sft/llada/openmath2-500k \\
+        --num_samples 1000 \\
+        --output_dir .cache/teacher_traj/openmath2-1k-256step
 
-How to do the mandatory mini-cache pre-flight (REENTRY_TD_SPEC.md §5.4)::
+Multi-GPU (data-parallel, one process per GPU)::
 
-    same as above but --num_samples 50, --shard_size 50,
-    a different --output_dir, and --audit.
+    torchrun --standalone --nproc_per_node=8 \\
+        -m dllm.tools.build_teacher_cache \\
+        --teacher_ckpt /path/to/teacher \\
+        --dataset_path .data/sft/llada/openmath2-500k \\
+        --num_samples 1000 \\
+        --output_dir .cache/teacher_traj/openmath2-1k-256step
+
+Mini-cache pre-flight (REENTRY_TD_SPEC.md §5.4)::
+
+    ... add --num_samples 50 --shard_size 50 --audit, and use a
+    different --output_dir.
 
 What this does:
 
-1. Loads the teacher SFT checkpoint and tokenizer.
-2. Loads a preprocessed SFT DatasetDict and extracts prompts (prefix
-   where ``labels == -100``).
-3. Selects ``num_samples`` prompts that fit ``max_prompt_len``.
-4. Groups them into shards of ``shard_size``; for each shard,
-   micro-batches through the deterministic sampler.
-5. Writes one shard directory of per-key ``.npy`` files per shard plus
-   a ``manifest.json`` that pins the git commit (audit-only), sampler
-   config hash, torch / cuda versions, and per-shard sample IDs.
+1. Loads the teacher SFT checkpoint and tokenizer on every rank
+   (one process per GPU under torchrun; one process total otherwise).
+2. Loads a preprocessed SFT DatasetDict on rank 0 and selects
+   ``num_samples`` prompts that fit ``max_prompt_len``. Selection is
+   deterministic, so all ranks compute the same sample list.
+3. Distributes shards round-robin across ranks: shard ``i`` is owned
+   by rank ``i % world_size``. Each rank micro-batches its own shards
+   through the deterministic sampler and writes them as memory-mapped
+   ``.npy`` files (see :class:`StreamingShardWriter`).
+4. ``rank 0`` gathers shard metadata, writes ``manifest.json``, and
+   runs the audit if ``--audit`` is set.
 """
 
 from __future__ import annotations
@@ -250,22 +256,65 @@ def build_shard(
 # ---------------------------------------------------------------------------
 
 
+def _init_distributed() -> tuple[int, int, int]:
+    """Return ``(rank, world_size, local_rank)``. Single-process if
+    ``LOCAL_RANK`` isn't set in the environment (torchrun / accelerate
+    set it; bare python doesn't).
+    """
+    if "LOCAL_RANK" not in os.environ:
+        return 0, 1, 0
+
+    import torch.distributed as dist
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+    return dist.get_rank(), dist.get_world_size(), local_rank
+
+
+def _cleanup_distributed() -> None:
+    if "LOCAL_RANK" in os.environ:
+        import torch.distributed as dist
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _is_main(rank: int) -> bool:
+    return rank == 0
+
+
 def main() -> int:
     args = parse_args()
+    rank, world_size, local_rank = _init_distributed()
 
+    def log(msg: str, all_ranks: bool = False) -> None:
+        if all_ranks:
+            print(f"[rank {rank}] {msg}", flush=True)
+        elif _is_main(rank):
+            print(f"[info] {msg}", flush=True)
+
+    # Every rank checks the same filesystem; they all reach the same
+    # decision, so no broadcast is needed and the early-return is safe.
     output_dir = Path(args.output_dir)
-    if output_dir.exists() and any(output_dir.iterdir()):
-        if not args.allow_overwrite:
+    if output_dir.exists() and any(output_dir.iterdir()) and not args.allow_overwrite:
+        if _is_main(rank):
             print(
                 f"[error] output_dir {output_dir} is non-empty. "
                 "Pass --allow_overwrite to clobber.",
                 file=sys.stderr,
             )
-            return 2
-    output_dir.mkdir(parents=True, exist_ok=True)
+        _cleanup_distributed()
+        return 2
 
-    # ---- Tokenizer ----
-    print(f"[info] loading tokenizer from {args.teacher_ckpt}", flush=True)
+    if _is_main(rank):
+        output_dir.mkdir(parents=True, exist_ok=True)
+    if world_size > 1:
+        import torch.distributed as dist
+        dist.barrier()  # wait for rank 0 to create output_dir
+
+    # ---- Tokenizer (every rank; cheap) ----
+    log(f"loading tokenizer from {args.teacher_ckpt}")
     tokenizer = get_tokenizer(model_name_or_path=args.teacher_ckpt)
     if tokenizer.mask_token_id is None:
         raise RuntimeError(
@@ -273,8 +322,8 @@ def main() -> int:
             "Make sure --teacher_ckpt points at a LLaDA SFT checkpoint."
         )
 
-    # ---- Teacher model ----
-    print(f"[info] loading teacher model ({args.dtype})", flush=True)
+    # ---- Teacher model (one per rank, on its own GPU) ----
+    log(f"loading teacher model ({args.dtype}) on cuda:{local_rank}")
     model = get_model(model_name_or_path=args.teacher_ckpt, dtype=args.dtype)
     model.eval()
     for p in model.parameters():
@@ -282,8 +331,8 @@ def main() -> int:
     if args.device != "cpu" and not next(model.parameters()).is_cuda:
         model = model.to(args.device)
 
-    # ---- Dataset ----
-    print(f"[info] loading dataset from {args.dataset_path} (split={args.dataset_split})", flush=True)
+    # ---- Dataset + sample selection (deterministic, every rank gets same list) ----
+    log(f"loading dataset from {args.dataset_path} (split={args.dataset_split})")
     ds = load_from_disk(args.dataset_path)
     if args.dataset_split not in ds:
         raise RuntimeError(
@@ -291,7 +340,7 @@ def main() -> int:
         )
     ds_split = ds[args.dataset_split]
 
-    print(f"[info] selecting {args.num_samples} prompts (max_prompt_len={args.max_prompt_len})", flush=True)
+    log(f"selecting {args.num_samples} prompts (max_prompt_len={args.max_prompt_len})")
     samples = select_samples(
         ds_split=ds_split,
         num_samples=args.num_samples,
@@ -310,7 +359,6 @@ def main() -> int:
     )
     sampler = DeterministicMDLMSampler(model=model, tokenizer=tokenizer)
 
-    # ---- Cache config + manifest skeleton ----
     cache_cfg = TrajectoryCacheConfig(
         teacher_model_path=args.teacher_ckpt,
         dataset_path=args.dataset_path,
@@ -331,38 +379,34 @@ def main() -> int:
     git_hash = _git_commit_hash() or "unknown"
     cuda_version = torch.version.cuda  # type: ignore[attr-defined]
 
-    manifest = CacheManifest(
-        config=cache_cfg,
-        git_commit_hash=git_hash,
-        sampler_config_hash=sampler_hash,
-        torch_version=torch.__version__,
-        cuda_version=cuda_version,
-        created_at=utcnow_iso(),
-        shards=[],
-    )
-
-    # ---- Build shards ----
+    # ---- Plan shards: round-robin across ranks ----
     num_shards = (args.num_samples + args.shard_size - 1) // args.shard_size
     eos_id = int(tokenizer.eos_token_id)
-    print(
-        f"[info] generating cache: {args.num_samples} samples, "
-        f"{args.teacher_steps} steps, top_k={args.top_k}, "
-        f"shard_size={args.shard_size} -> {num_shards} shards",
-        flush=True,
-    )
 
+    my_shard_indices = [i for i in range(num_shards) if i % world_size == rank]
+
+    if _is_main(rank):
+        log(
+            f"generating cache: {args.num_samples} samples, "
+            f"{args.teacher_steps} steps, top_k={args.top_k}, "
+            f"shard_size={args.shard_size} -> {num_shards} shards, "
+            f"distributed across world_size={world_size}"
+        )
+
+    # ---- Build my shards ----
+    my_shard_infos: list[tuple[int, ShardInfo]] = []
     t_global = time.time()
-    for shard_idx in range(num_shards):
+    for n_done, shard_idx in enumerate(my_shard_indices):
         start = shard_idx * args.shard_size
         end = min(start + args.shard_size, args.num_samples)
         shard_samples = samples[start:end]
-        rel_path = f"shard_{shard_idx:04d}"  # directory, not a file
+        rel_path = f"shard_{shard_idx:04d}"
         shard_path = output_dir / rel_path
 
         print(
-            f"[info] shard {shard_idx + 1}/{num_shards}: "
-            f"{len(shard_samples)} samples (sample_ids "
-            f"{shard_samples[0]['sample_id']}..{shard_samples[-1]['sample_id']})",
+            f"[rank {rank}] shard {shard_idx} "
+            f"({n_done + 1}/{len(my_shard_indices)} mine): {len(shard_samples)} samples "
+            f"(sample_ids {shard_samples[0]['sample_id']}..{shard_samples[-1]['sample_id']})",
             flush=True,
         )
         t0 = time.time()
@@ -376,30 +420,76 @@ def main() -> int:
         )
         t_total = time.time() - t0
         size_mb = sum(p.stat().st_size for p in shard_path.rglob("*.npy")) / (1 << 20)
-        print(f"[info]   sampled+wrote {size_mb:.1f} MB in {t_total:.1f}s", flush=True)
+        print(
+            f"[rank {rank}]   shard {shard_idx}: {size_mb:.1f} MB in {t_total:.1f}s",
+            flush=True,
+        )
 
-        manifest.shards.append(
+        my_shard_infos.append((
+            shard_idx,
             ShardInfo(
                 path=rel_path,
                 sample_ids=[int(s["sample_id"]) for s in shard_samples],
                 t_shard=t_shard,
-            )
-        )
-        manifest.save(output_dir)  # incremental save in case of crash
+            ),
+        ))
+
+    # ---- Gather shard infos to rank 0 + write manifest ----
+    if world_size > 1:
+        import torch.distributed as dist
+        gathered: list[list[tuple[int, ShardInfo]] | None] = [None] * world_size
+        dist.all_gather_object(gathered, my_shard_infos)
+        dist.barrier()
+        all_infos: list[tuple[int, ShardInfo]] = []
+        for lst in gathered:
+            all_infos.extend(lst)  # type: ignore[arg-type]
+    else:
+        all_infos = my_shard_infos
+
+    all_infos.sort(key=lambda x: x[0])
+    sorted_shard_infos = [info for _, info in all_infos]
 
     elapsed = time.time() - t_global
-    print(f"[info] done. {num_shards} shards in {elapsed:.1f}s", flush=True)
 
-    if args.audit:
+    if _is_main(rank):
+        manifest = CacheManifest(
+            config=cache_cfg,
+            git_commit_hash=git_hash,
+            sampler_config_hash=sampler_hash,
+            torch_version=torch.__version__,
+            cuda_version=cuda_version,
+            created_at=utcnow_iso(),
+            shards=sorted_shard_infos,
+        )
+        manifest.save(output_dir)
+        log(f"done. {num_shards} shards in {elapsed:.1f}s (wall time)")
+
+    if world_size > 1:
+        import torch.distributed as dist
+        dist.barrier()
+    _cleanup_distributed()
+
+    # ---- Audit only on rank 0 ----
+    if _is_main(rank) and args.audit:
+        manifest_for_audit = CacheManifest(
+            config=cache_cfg,
+            git_commit_hash=git_hash,
+            sampler_config_hash=sampler_hash,
+            torch_version=torch.__version__,
+            cuda_version=cuda_version,
+            created_at=utcnow_iso(),
+            shards=sorted_shard_infos,
+        )
         ok = run_audit(
             output_dir=output_dir,
-            manifest=manifest,
+            manifest=manifest_for_audit,
             min_pass_frac=args.audit_min_pass_frac,
             min_top_k_mass=args.audit_min_top_k_mass,
         )
         if not ok:
             print(
-                "[error] audit FAILED. Consider re-running with a larger --top_k.",
+                "[error] audit FAILED. Consider re-running with a larger --top_k, "
+                "or relaxing --audit_min_top_k_mass / --audit_min_pass_frac.",
                 file=sys.stderr,
             )
             return 3
