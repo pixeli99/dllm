@@ -185,26 +185,33 @@ def test_dataset_len_and_item_shapes():
 
 def test_dataset_index_to_step_mapping():
     """input_teacher_step = student_step * stride; target_teacher_step =
-    input + stride - 1 (the progressive-distillation shift)."""
+    min(input + stride, teacher_steps - 1) -- the full stride lookahead,
+    clamped at the last valid step for the final student step."""
     with tempfile.TemporaryDirectory() as td:
         _build_fake_cache(td, num_samples=2, teacher_steps=8, max_response_len=4, top_k=4)
         ds = _quiet_dataset(td, student_steps=4, teacher_stride=2)
         for i in range(len(ds)):
             item = ds[i]
             assert item["input_teacher_step"] == item["student_step"] * 2
-            assert item["target_teacher_step"] == item["input_teacher_step"] + 1
+            expected_target = min(item["input_teacher_step"] + 2, 8 - 1)
+            assert item["target_teacher_step"] == expected_target
 
 
-def test_dataset_target_is_shifted_from_input():
-    """Progressive-distillation target step is one less than the next
-    student step's input step. With teacher_steps=8 and stride=2:
-      student_step 0 -> input 0, target 1
-      student_step 1 -> input 2, target 3
-      ...
-      student_step 3 -> input 6, target 7  (last valid teacher step)
-    Same-step (input == target) would make the loss zero on a
-    student initialised from the teacher; the shift is what gives the
-    student a non-trivial training signal.
+def test_dataset_target_is_shifted_by_full_stride():
+    """Progressive-distillation target step is ``input + stride``, with
+    a clamp to teacher_steps - 1 for the final student step only. With
+    teacher_steps=8 and stride=2:
+
+      student_step 0 -> input 0, target 2
+      student_step 1 -> input 2, target 4
+      student_step 2 -> input 4, target 6
+      student_step 3 -> input 6, target 7  (clamped from 8)
+
+    The stride-step shift (not stride-1) is what aligns the supervision
+    with the compression target: at M_{input+stride}, exactly ``stride``
+    positions committed during the window are sharp echoes, so the
+    student learns to put sharp top-1 confidence at ``stride`` positions
+    per student step. Sampler then commits exactly those.
     """
     with tempfile.TemporaryDirectory() as td:
         _build_fake_cache(td, num_samples=1, shard_size=1,
@@ -215,7 +222,7 @@ def test_dataset_target_is_shifted_from_input():
             item = ds[i]
             seen.add((item["student_step"], item["input_teacher_step"],
                       item["target_teacher_step"]))
-        assert seen == {(0, 0, 1), (1, 2, 3), (2, 4, 5), (3, 6, 7)}
+        assert seen == {(0, 0, 2), (1, 2, 4), (2, 4, 6), (3, 6, 7)}
 
 
 def test_dataset_target_uses_target_step_top_k_not_input_step():
@@ -272,17 +279,17 @@ def test_dataset_target_uses_target_step_top_k_not_input_step():
 
         ds = _quiet_dataset(td, student_steps=4, teacher_stride=2)
 
-        # student_step 0 -> input 0, target 1. The teacher indices we
-        # see should be from step 1, i.e., value 101.
+        # student_step 0 -> input 0, target 2. The teacher indices we
+        # see should be from step 2, i.e., value 102.
         item0 = ds[0]
         assert item0["input_teacher_step"] == 0
-        assert item0["target_teacher_step"] == 1
-        assert int(item0["teacher_top_k_indices"][0, 0]) == 101, (
-            f"expected target step 1 (id 101), got "
+        assert item0["target_teacher_step"] == 2
+        assert int(item0["teacher_top_k_indices"][0, 0]) == 102, (
+            f"expected target step 2 (id 102), got "
             f"{int(item0['teacher_top_k_indices'][0, 0])}"
         )
 
-        # student_step 3 -> input 6, target 7.
+        # student_step 3 -> input 6, target = min(8, 7) = 7 (clamped).
         item3 = ds[3]
         assert item3["target_teacher_step"] == 7
         assert int(item3["teacher_top_k_indices"][0, 0]) == 107

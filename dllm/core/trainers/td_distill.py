@@ -133,6 +133,7 @@ class TrajectoryCacheDataset(Dataset):
 
         self.student_steps = student_steps
         self.teacher_stride = teacher_stride
+        self.teacher_steps = cfg.teacher_steps
         self.mask_token_id = cfg.mask_token_id
         self.eos_token_id = cfg.eos_token_id
         self.max_response_len = cfg.max_response_len
@@ -191,39 +192,55 @@ class TrajectoryCacheDataset(Dataset):
 
         ``student_step`` -> two teacher steps:
 
-        * ``input_teacher_step  = student_step * stride``: which mask state
-          the student sees as input (so the student is told "you are at
-          this point in the trajectory").
-        * ``target_teacher_step = input_teacher_step + stride - 1``: which
-          teacher distribution the student is supervised against.
+        * ``input_teacher_step  = student_step * stride``: which mask
+          state the student sees as input ("you are at this point in
+          the trajectory").
+        * ``target_teacher_step = min(input + stride, teacher_steps - 1)``:
+          which teacher distribution the student is supervised against.
 
-        The +stride-1 shift is the heart of progressive distillation.
-        Same-step targets (input == target) make the loss ~0 because the
-        student is initialised from the teacher checkpoint, so its
-        forward IS teacher's forward -- no training signal. Shifted
-        targets ask the student to predict, in one forward at M_input,
-        teacher's distribution after committing stride-1 more positions.
-        That distribution is sharp at the already-committed positions
-        and concentrated at the next position teacher would commit, so
-        the student's top-stride confidence ends up exactly at the
-        stride positions teacher commits over the corresponding stride
-        steps. At inference, the student's stride commits per step then
-        match teacher's stride commits.
+        The ``+stride`` shift (clamped to the last valid step for the
+        final student step) is the heart of progressive distillation.
+        Same-step targets (input == target) make the loss ~0 because
+        the student is initialised from the teacher checkpoint, so its
+        forward IS teacher's forward -- no training signal. With a
+        stride shift, the student learns to predict, in ONE forward at
+        M_input, what teacher's belief looks like AFTER stride teacher
+        commits. At M_{input + stride}, exactly the ``stride`` positions
+        teacher committed during that window are SHARP echoes of their
+        committed tokens; other masked positions carry teacher's
+        refined mid-trajectory belief.
 
-        Supervised positions are masked-at-INPUT (which is what the
-        student sees and must predict). For positions that teacher
-        committed between input and target, teacher's recorded
-        distribution at target is sharp at the committed token --
-        student learns to commit. For positions still masked at target,
-        student learns teacher's refined mid-trajectory belief.
+        The student therefore learns, at M_input, to produce a
+        distribution where ``stride`` distinct positions
+        (p_input, p_{input+1}, ..., p_{input+stride-1}) all have sharp
+        top-1 confidence at their teacher-committed tokens. The
+        confidence-based sampler at inference then picks exactly those
+        ``stride`` positions per student step (top-K commit), matching
+        teacher's stride-step segment in one student step.
 
-        Edge case bookkeeping: with input = (S-1)*stride and target =
-        input + stride - 1, target is at most S*stride - 1 =
-        teacher_steps - 1, so the last student step is always valid.
+        Supervised positions are masked-at-INPUT (what the student
+        actually has to predict). For positions teacher committed
+        between input and target, the target distribution is sharp at
+        the committed token; for positions still masked at target, it
+        is teacher's refined belief.
+
+        Edge case: input = (S-1)*stride gives target = S*stride =
+        teacher_steps, which is one past the last recorded step.
+        ``min(..., teacher_steps - 1)`` clamps it to the last valid
+        step. This weakens the supervision of the very last student
+        step by one teacher commit; the other S-1 student steps are
+        unaffected. An earlier version of this code shifted by
+        ``stride - 1`` to avoid the clamp -- that was wrong: it
+        supervised only ``stride - 1`` sharp echoes, so at stride=2
+        the student only had to learn one sharp position per step
+        rather than two, weakening the compression target by half.
         """
         sample_global_idx, student_step = divmod(i, self.student_steps)
         input_teacher_step = student_step * self.teacher_stride
-        target_teacher_step = input_teacher_step + self.teacher_stride - 1
+        target_teacher_step = min(
+            input_teacher_step + self.teacher_stride,
+            self.teacher_steps - 1,
+        )
         shard_idx, idx_in_shard, sample_id = self._sample_idx[sample_global_idx]
 
         shard = self._shard(shard_idx)
