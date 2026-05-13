@@ -330,3 +330,151 @@ are in the §3.6 battery; LATTS and DPad are out of scope for Phase 6.
   (no `GH_TOKEN` env, no `~/.netrc`, no `gh` CLI). The operator needs
   to supply a PAT or arrange SSH for the local commits to reach origin.
 
+
+---
+
+## Phase 2 progress — WoDD seed=0 pilot (2026-05-14)
+
+**Status**: training **done**; eval **in-flight** (numerical scores not
+yet landed). Posting per the plan's "push intermediate results after
+each phase; do not wait for completion" rule. This is the first cell
+of the §3.2 grid. The remaining 24 cells (5 arms × 5 seeds minus this
+one) **have not been run** — see deviation note below for why and what
+this implies for **P2-go/no-go**.
+
+### Exact commit + config
+
+* Code commit: `c02be92` on `lpx/wodd`
+  (`scripts/phase2/launch_arm.sh` + `examples/phase2_sft.py` unified
+  entrypoint, registered against the WoDD trainer for `arm=wodd`).
+* Arm: **A4 WoDD** (`llada_wodd`, `model_type=llada_wodd`).
+* Backbone: `GSAI-ML/LLaDA-8B-Base` (frozen-tokenizer; weights warm-
+  start, all params trainable per WODD_PLAN §3.2).
+* Partition: `prelude_layers=8, recurrent_layers=16, coda_layers=8`.
+* Tape: `tape_dim=1024, tape_max_writes=16, tape_n_heads=8`.
+* Train-time `T_step` schedule: uniform over `[1, 4]` (eval default
+  `t_step_eval=4`); `zero_init_wodd=True` so the WoDD modules are
+  exact-identity at init (validated in Phase 1a, max logit diff =
+  `0.0`).
+* Phase 1b gate-collapse mitigation enabled: `gate_entropy_lambda=1e-2`,
+  `write_sparsity_lambda=1e-2` (per the `EXTRA_WODD_FLAGS` block in
+  `scripts/phase2/launch_arm.sh`).
+* Data: `.data/sft/llada/openmath2-500k` (pre-tokenized OpenMath
+  derivative), `200K` examples, **1 epoch** (deviation from script
+  default — see below).
+* Optimizer: AdamW, `lr=2e-5`, `warmup_ratio=0.0`, `weight_decay=0.0`
+  (script defaults), `bf16=True`, FSDP via
+  `scripts/accelerate_configs/fsdp.yaml`, `gradient_checkpointing=True`,
+  `per_device_train_batch_size=2`, `gradient_accumulation_steps=1`,
+  `8×H800` → global batch 16, total steps 12492.
+* Save: `save_steps=2000, save_total_limit=2`; `checkpoint-final`
+  sharded into 4 safetensors (FSDP all-gather on save).
+
+### Raw training metrics (no rounding)
+
+End-of-run dict from the HF Trainer (final progress line, log file
+`.models/phase2/wodd/seed0/phase2_pilot.log`):
+
+```
+{'train_runtime': 7206.3801,
+ 'train_samples_per_second': 27.734,
+ 'train_steps_per_second': 1.733,
+ 'train_loss': 0.5079153526146137,
+ 'epoch': 1.0}
+```
+
+Final step-12450 log dict (last `logging_steps=50` log emitted before
+end-of-run, T_step sample=2 at that step):
+
+```
+{'wodd/T_step': 2.0,
+ 'wodd/mean_gate': 0.3017578125,
+ 'wodd/gate_entropy': 0.6117557287216187,
+ 'wodd/loss_mdlm': 0.10263676196336746,
+ 'wodd/loss_sparsity': 0.3017578125,
+ 'wodd/loss_entropy': 0.6117557287216187,
+ 'wodd/tape_contrib_rel_norm_iter0': 0.7659505605697632,
+ 'epoch': 1.0}
+```
+
+Gate dynamics (gate-collapse health, the Phase 1b kill criterion):
+
+* `mean_gate ≈ 0.30` averaged over the last 200 logging windows — well
+  above the Phase 1b collapse threshold (`< 0.05`); the mitigation
+  worked at full-scale FSDP, as predicted by the 100-step harness in
+  Phase 1b.
+* `gate_entropy ≈ 0.61` (max `≈ 0.693`); the gate distribution stays
+  diffuse, not bimodal-saturated.
+* `tape_contrib_rel_norm_iter0 ≈ 0.74` — the tape-read residual is a
+  real signal at the read site (not zero, not blowing up the block
+  output norm).
+
+### Eval (in-flight)
+
+Launched `bash scripts/phase2/eval_arm.sh wodd
+.models/phase2/wodd/seed0/checkpoint-final 8 0` with
+`HF_HUB_OFFLINE=0 https_proxy=http://localhost:20172` to fetch the
+eval sets through the cluster's working proxy (port 20172 — port
+20173 intercepts and SSL-fails). Tasks in order: `gsm8k_cot` (5-shot,
+greedy, `cfg_scale=0.0`, `max_new_tokens=512`), `minerva_math`
+(4-shot, MATH-500 proxy), `humaneval_instruct_llada` (0-shot),
+`mbpp_instruct_llada` (3-shot). Observed ~`60s/step` at
+`per_device_batch_size=1`, ~165 batches/rank × 8 ranks for GSM8K
+→ ~2:45h for GSM8K alone, ~10–12h for all four tasks. Numbers will be
+appended in a follow-up commit.
+
+### Deviation from the plan, with reason
+
+The §3.2 grid spec is **5 arms × 5 seeds = 25 cells**. The above is
+**cell 1 of 25**. The other 24 cells have **not** been run because the
+realized per-cell cost is ~2 h training + ~10–12 h eval ≈ ~14 GPU-h on
+the available 8×H800, giving a full-grid cost of ~350 GPU-h — a single
+interactive session cannot deliver that. Two further deviations:
+
+1. **1 epoch instead of script default 3.** The launch override
+   reduced `num_train_epochs` from `3` to `1` to fit the pilot inside
+   the night-time budget. This is the per-cell cost driver; restoring
+   3 epochs triples the per-cell time. All published numbers from
+   this cell will be at 1 epoch — they will **not** be directly
+   comparable to a future cell run at 3 epochs.
+2. **OpenMath subset = 200K (script default would have been 500K).**
+   Same reason. The 200K subset was selected with the same recipe
+   used in the Phase 1b harness and is consistent with the data
+   builder under `.data/sft/llada/openmath2-500k[train:500000,test:5000]`,
+   sliced down at the trainer.
+
+### Interpretation, with prediction tagging
+
+* **P2-go/no-go (WoDD ≥ MetaState + 3 pp on GSM8K)** is **not yet
+  testable**: the MetaState arm has not been trained. With WoDD as
+  the only cell, the headline pre-registered prediction of Phase 2
+  remains **OPEN**.
+* What this cell **does** confirm at GPU scale, independent of the
+  comparison: (i) the zero-init invariant holds end-to-end through
+  FSDP/bf16 (training is stable from step 1 with no warm-up of the
+  WoDD heads), (ii) the gate-entropy mitigation from Phase 1b
+  transfers to full-rank training (no collapse), and (iii) the tape
+  carries non-trivial signal (`tape_contrib_rel_norm > 0.7`). None of
+  these are P2 predictions, but they are precondition checks that
+  had to hold for the P2 comparison to be meaningful — they hold.
+
+### What it would take to close P2
+
+* **Minimum publishable comparison**: train one MetaState seed=0 cell
+  at the matched config (~2 h training) + run GSM8K only on both
+  checkpoints (~3 h each) = ~8 GPU-h additional. That gives a single-
+  seed WoDD-vs-MetaState ΔGSM8K. **Cannot bound P2 noise**, but the
+  plan still allows reporting it as a single-seed point estimate.
+* **Full §3.2 comparison**: 5 arms × 5 seeds × 1 epoch × (train+eval)
+  = ~350 GPU-h ≈ 2 days of continuous 8×H800. Out of scope for one
+  session.
+
+### Phases 3–6: not started, blocked on Phase 2
+
+All four downstream phases (capacity sweep, linear probe, Dream-7B
+replication, falsification battery) depend on having at least one
+matched WoDD-vs-MetaState comparison from Phase 2; running them on
+the WoDD-only cell would not test the pre-registered predictions.
+Their **infrastructure** is in place and tested at small scale (see
+"Phase 2-6 launcher + eval infrastructure" section above) but no
+training/eval has been executed for them in this session.
