@@ -167,4 +167,79 @@ gate-collapse signature, so the deviation does not change the conclusion.
 2. If Phase 2 sees gate collapse again at 8×H800 effective batch (16),
    apply the same mitigation — but report the gap honestly first.
 
+---
+
+## Phase 2 — infrastructure ready, training pending (2026-05-13)
+
+This is a status entry, not a result. Phase 2 actual training (5 arms ×
+5 seeds × ~6–10 GPU-h each ≈ 150–250 GPU-h) is the next operator action.
+
+### Baselines implemented and unit-tested
+
+Commit `lpx/wodd@39b6111` (`pipelines: add LATTS / MetaState / DPad
+baselines for Phase 2`). Three new pipelines:
+
+| Arm | Pipeline | Trainable surface (toy d=64) | Strict drop-in invariant at zero-init |
+|-----|----------|------------------------------|---------------------------------------|
+| A0 | (vanilla `LLaDAModelLM`)             | 0 (frozen)             | — |
+| A1 | `dllm.pipelines.llada_latts`         | 0 (frozen)             | yes (T_step=1, max diff 0.0) |
+| A2 | `dllm.pipelines.llada_metastate`     | state_init + state_read + state_update | yes (zero_init_metastate=True, max diff 0.0) |
+| A3 | `dllm.pipelines.llada_dpad`          | suffix scratchpad      | **no** — softmax renormalisation over K extra positions causes O(K/T) drift even with K/V at scratch positions = 0; documented and bounded by test |
+| A4 | `dllm.pipelines.llada_wodd` (existing)| write_head + tape_read | yes (zero_init_wodd=True, max diff 0.0 per Phase 1a) |
+
+Unit tests under `tests/baselines/test_baselines_forward.py` (10 cases) +
+the existing `tests/wodd/` (27 cases). All **37/37 pass** at `lpx/wodd@23fcd38`.
+
+### Param counts at production scale (8 B backbone, 1 H800 fp32 load + bf16 train)
+
+Empirical from a 2-step Phase 2 smoke run (`metastate` arm, default
+`state_slots=64`, `state_dim=1024`, `state_n_heads=8`):
+
+| Arm | Trainable params | % of backbone |
+|-----|-----------------:|--------------:|
+| A2 MetaState (slots=64, dim=1024) | 26 301 440 | 0.327 % |
+| A4 WoDD (tape_dim=1024, max_writes=16) | 14 727 169 | 0.183 % |
+
+The MetaState slot-count is sized for Phase 3's capacity-sweep envelope
+(M ∈ {64,128,256,512,1024} → state_init param count scales linearly with
+M while StateRead / StateUpdate stay constant; test
+`test_metastate_state_param_count_independent_of_slots` pins this).
+A1 LATTS and A0 vanilla have no trainable adapter; A3 DPad's count at
+`dpad_len=512` is `512*4096 = 2.1 M` (~0.026 %) — well below the WODD_PLAN
+"~1 %" rough target, which would need an extra MLP head on the scratchpad
+or larger `dpad_len`. We flag this gap rather than tuning to hit the
+exact %; matched FLOPs is the explicit target, not matched parameter
+count, per WODD_PLAN.md §3.2 footnote.
+
+### Phase 2 launcher
+
+Commit `lpx/wodd@23fcd38` (`phase2: unified train entry + launcher
+scripts (5-arm head-to-head)`). Single entry point dispatches all five
+arms by `--arm` flag and freezes the LLaDA backbone for every arm except
+vanilla. Smoke-tested end-to-end on all five arms (single H800, B=1,
+max_steps=1–2) — checkpoint-final written for each.
+
+Run a single cell:
+```
+bash scripts/phase2/launch_arm.sh wodd 0       # arm=wodd, seed=0
+```
+Run the full grid:
+```
+bash scripts/phase2/launch_all.sh              # 5 arms × 5 seeds
+```
+
+The wodd cell pins `--gate_entropy_lambda 1e-2 --write_sparsity_lambda
+1e-2` (Phase 1b mitigation; the trainer default 1e-3 collapsed the gate
+within 100 steps).
+
+### Not yet implemented in this session
+
+- Phase 2 actual training runs and eval (estimate: 150–250 GPU-h for the
+  full 5×5 grid, plus eval).
+- Phase 3 capacity-sweep launcher (small scaffold; reuses Phase 2 launcher
+  with `--arm_kwargs_json '{"state_slots": M}'` / WoDD analogous).
+- Phase 4 linear-probe pipeline (needs a converged WoDD-8B checkpoint
+  from Phase 2/3 to extract `v_k`).
+- Phase 5 Dream-7B port of the WoDD architecture.
+- Phase 6 falsification tasks (GLUE / TriviaQA / 2-digit add).
 
