@@ -6,3 +6,12 @@ __all__ = [
     "LLaDAMetaStateModel",
     "LLaDAMetaStateModelLM",
 ]
+
+try:
+    from transformers import AutoConfig, AutoModel, AutoModelForMaskedLM
+
+    AutoConfig.register("llada_metastate", LLaDAMetaStateConfig)
+    AutoModel.register(LLaDAMetaStateConfig, LLaDAMetaStateModelLM)
+    AutoModelForMaskedLM.register(LLaDAMetaStateConfig, LLaDAMetaStateModelLM)
+except ImportError:
+    pass

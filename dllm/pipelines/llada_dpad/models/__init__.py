@@ -6,3 +6,12 @@ __all__ = [
     "LLaDADPadModel",
     "LLaDADPadModelLM",
 ]
+
+try:
+    from transformers import AutoConfig, AutoModel, AutoModelForMaskedLM
+
+    AutoConfig.register("llada_dpad", LLaDADPadConfig)
+    AutoModel.register(LLaDADPadConfig, LLaDADPadModelLM)
+    AutoModelForMaskedLM.register(LLaDADPadConfig, LLaDADPadModelLM)
+except ImportError:
+    pass
