@@ -65,6 +65,11 @@ def _toy_config(**overrides):
         alibi=False,
         block_group_size=1,
         block_type="llama",
+        # LLaDALlamaBlock implements SwiGLU-style gating *manually*
+        # (separate ff_proj + up_proj, elementwise mul). It expects an
+        # activation whose output_multiplier == 1 (i.e. SiLU). Using the
+        # SwiGLU Activation class would halve the hidden dim and mismatch.
+        activation_type="silu",
         weight_tying=True,
         scale_logits=False,
         input_emb_norm=False,
@@ -89,6 +94,15 @@ def _toy_config(**overrides):
     return cfg
 
 
+def _model_device(m):
+    """Return the device any one parameter of `m` lives on. The toy LLaDA
+    LM wrapper hard-codes `init_device='cuda'` internally (overriding the
+    config), so when CUDA is available the model ends up on cuda:0 even
+    though the toy config requests cpu. Inputs must follow.
+    """
+    return next(m.parameters()).device
+
+
 @pytest.fixture(scope="module")
 def model():
     torch.manual_seed(0)
@@ -103,9 +117,10 @@ def model():
 # ---------------------------------------------------------------------------
 
 def test_forward_shapes(model):
+    dev = _model_device(model)
     B, T = 2, 8
-    input_ids = torch.randint(0, 100, (B, T))
-    attention_mask = torch.ones(B, T, dtype=torch.long)
+    input_ids = torch.randint(0, 100, (B, T), device=dev)
+    attention_mask = torch.ones(B, T, dtype=torch.long, device=dev)
 
     out = model(
         input_ids=input_ids,
@@ -117,9 +132,10 @@ def test_forward_shapes(model):
 
 
 def test_forward_t_step_matches_tape_length(model):
+    dev = _model_device(model)
     B, T = 1, 6
-    input_ids = torch.randint(0, 100, (B, T))
-    attention_mask = torch.ones(B, T, dtype=torch.long)
+    input_ids = torch.randint(0, 100, (B, T), device=dev)
+    attention_mask = torch.ones(B, T, dtype=torch.long, device=dev)
 
     for K in (1, 2, 4):
         out = model(
@@ -132,9 +148,10 @@ def test_forward_t_step_matches_tape_length(model):
 
 def test_forward_t_step_above_max_raises(model):
     """T_step must not exceed tape_max_writes."""
+    dev = _model_device(model)
     B, T = 1, 4
-    input_ids = torch.randint(0, 100, (B, T))
-    attention_mask = torch.ones(B, T, dtype=torch.long)
+    input_ids = torch.randint(0, 100, (B, T), device=dev)
+    attention_mask = torch.ones(B, T, dtype=torch.long, device=dev)
 
     with pytest.raises(ValueError, match="exceeds tape_max_writes"):
         model(
@@ -161,9 +178,10 @@ def test_zero_init_matches_vanilla_split(model):
     with NO inner loop (the recurrent block applied exactly once). This is
     the strict drop-in claim.
     """
+    dev = _model_device(model)
     B, T = 2, 6
-    input_ids = torch.randint(0, 100, (B, T))
-    attention_mask = torch.ones(B, T, dtype=torch.long)
+    input_ids = torch.randint(0, 100, (B, T), device=dev)
+    attention_mask = torch.ones(B, T, dtype=torch.long, device=dev)
 
     out_t1 = model(
         input_ids=input_ids,
@@ -190,9 +208,10 @@ def test_zero_init_matches_vanilla_split(model):
 
 def test_zero_init_tape_contribution_zero(model):
     """At init with zero_init_wodd=True, tape_contrib_rel_norm should be 0."""
+    dev = _model_device(model)
     B, T = 1, 4
-    input_ids = torch.randint(0, 100, (B, T))
-    attention_mask = torch.ones(B, T, dtype=torch.long)
+    input_ids = torch.randint(0, 100, (B, T), device=dev)
+    attention_mask = torch.ones(B, T, dtype=torch.long, device=dev)
 
     out = model(
         input_ids=input_ids,
@@ -223,6 +242,7 @@ def test_one_training_step_updates_wodd_params():
     cfg = _toy_config()
     m = LLaDAWoDDModelLM(cfg, init_params=True).to(dtype=torch.float32)
     m.train()
+    dev = _model_device(m)
 
     # Snapshot initial params.
     init_state = {
@@ -232,8 +252,8 @@ def test_one_training_step_updates_wodd_params():
     }
 
     B, T = 2, 6
-    input_ids = torch.randint(0, 100, (B, T))
-    attention_mask = torch.ones(B, T, dtype=torch.long)
+    input_ids = torch.randint(0, 100, (B, T), device=dev)
+    attention_mask = torch.ones(B, T, dtype=torch.long, device=dev)
     labels = input_ids.clone()
     labels[:, :2] = -100  # mask prompt loss
 
