@@ -234,12 +234,99 @@ within 100 steps).
 
 ### Not yet implemented in this session
 
-- Phase 2 actual training runs and eval (estimate: 150–250 GPU-h for the
-  full 5×5 grid, plus eval).
-- Phase 3 capacity-sweep launcher (small scaffold; reuses Phase 2 launcher
-  with `--arm_kwargs_json '{"state_slots": M}'` / WoDD analogous).
-- Phase 4 linear-probe pipeline (needs a converged WoDD-8B checkpoint
-  from Phase 2/3 to extract `v_k`).
+- Phase 2 / 3 / 4 / 6 *training* runs and *evaluation* — all the
+  scaffolding is in place (see below); compute remains to be spent.
 - Phase 5 Dream-7B port of the WoDD architecture.
-- Phase 6 falsification tasks (GLUE / TriviaQA / 2-digit add).
+
+---
+
+## Phase 2–6 launcher + eval infrastructure (2026-05-14)
+
+Commit `lpx/wodd@0233ee1` (`phase 2-6 infrastructure: per-arm eval
+entries + launchers`). The full 6-phase program is now runnable from
+the shell with no further coding; only compute and human go/no-go
+remain. 37/37 tests still pass.
+
+### Per-arm eval registrations
+
+Each new pipeline ships an `eval.py` that registers itself with
+`lm_eval`'s `--model` namespace and with `transformers.AutoConfig` /
+`AutoModel`. After this commit, `lm-eval --model X --model_args
+pretrained=PATH` works for every arm:
+
+| Arm | `lm_eval --model` flag | HF `model_type` |
+|-----|------------------------|-----------------|
+| A0 vanilla    | `llada`           | `llada`           |
+| A1 LATTS      | `llada_latts`     | `llada_latts`     |
+| A2 MetaState  | `llada_metastate` | `llada_metastate` |
+| A3 DPad       | `llada_dpad`      | `llada_dpad`      |
+| A4 WoDD       | `llada_wodd`      | `llada_wodd`      |
+
+Smoke-tested: importing each `eval.py` populates `lm_eval.MODEL_REGISTRY`
+and `AutoConfig.for_model("llada_X")` resolves without
+`trust_remote_code`.
+
+### Phase 2 launcher and eval
+
+```
+scripts/phase2/launch_arm.sh ARM SEED          # one (arm, seed) cell
+scripts/phase2/launch_all.sh                   # full 5×5 grid
+scripts/phase2/eval_arm.sh ARM CHECKPOINT [num_gpu]
+                                               # gsm8k_cot + minerva_math
+                                               # + humaneval + mbpp
+```
+Greedy decoding (cfg_scale=0.0) for pass@1 per WODD_PLAN.md §3.2.
+Self-consistency N=16 is a separate run pattern (not in this script).
+
+### Phase 3 (headline scaling-law) launcher and eval
+
+```
+scripts/phase3/launch_capacity_sweep.sh        # 10 cells (5 + 5)
+scripts/phase3/eval_sweep.sh                   # GSM8K + MATH-500 only
+```
+Sweeps exactly the §3.3 specification:
+* MetaState slots ∈ {64, 128, 256, 512, 1024} × dim 1024.
+* WoDD (tape_dim, T_step) ∈ {(256,4),(512,4),(1024,4),(1024,8),(1024,16)}.
+
+### Phase 4 linear probe (needs a converged WoDD checkpoint)
+
+```
+python examples/phase4/extract_tape_and_teacher.py \
+    --wodd_checkpoint .models/phase3/wodd_d1024_T16/checkpoint-final \
+    --teacher_model Qwen/Qwen3-8B-Math \
+    --gsm8k_path hf:openai/gsm8k:main \
+    --n_examples 500
+python examples/phase4/train_probe.py --data_path .phase4/tape_and_teacher.pt
+```
+The pre-gate `v_k` are captured via a forward hook on
+`write_head.content_proj`. Token classes (5-way) from
+WODD_PLAN.md §3.4: digit / operator / variable-binding / answer-form /
+other. P4-PASS: accuracy > 0.5 (chance ≈ 0.2).
+
+### Phase 6 falsification
+
+```
+scripts/phase6/eval_falsification.sh           # all three settings
+```
+* (a) GLUE cola, short-output classification — predicted WoDD ≈ vanilla
+* (b) TriviaQA closed-book — predicted WoDD ≈ vanilla
+* (c) 2-digit addition (synthetic) via
+  `examples/phase6/eval_two_digit_add.py` — predicted
+  WoDD ≈ MetaState below the bit-budget threshold; separates above.
+
+Per the plan only the three named arms (vanilla / metastate / wodd)
+are in the §3.6 battery; LATTS and DPad are out of scope for Phase 6.
+
+### What's still missing
+
+* **Phase 5 Dream-7B port**: needs a `dllm/pipelines/dream_wodd/`
+  pipeline analogous to `llada_wodd`, plus the matching eval entry.
+  Not started; flagged for the next session.
+* **GPU compute**: every step from Phase 2 onward needs cluster time.
+  Total budget for the full 6-phase program: roughly 200-300 GPU-h on
+  8×H800 (mostly Phase 2 and Phase 3 training).
+* **`git push` access**: cluster proxy on port 20172 tunnels HTTPS
+  cleanly; the push fails because no GitHub credential is configured
+  (no `GH_TOKEN` env, no `~/.netrc`, no `gh` CLI). The operator needs
+  to supply a PAT or arrange SSH for the local commits to reach origin.
 
