@@ -54,4 +54,117 @@ Phase 1–6 runs; both are toy-test-only.
 
 ---
 
-<!-- Phase 1 results below this line. -->
+## Phase 1 — sanity (2026-05-13)
+
+### Phase 1a: zero-init logit identity on LLaDA-8B-Base
+
+**Status: PASS (bit-identical, 0.0 abs diff).** Cluster-goal kill criterion
+holds at GPU scale.
+
+- Commit: `lpx/wodd@1fd8bb4` (`examples/llada_wodd: add Phase 1a zero-init identity script`)
+- Script: `examples/llada_wodd/phase1a_zero_init_identity.py`
+- Compute: 1× H800 80 GB, fp32 throughout.
+- Model: `GSAI-ML/LLaDA-8B-Base` (n_layers=32, d_model=4096, embedding_size=126464,
+  activation_type=silu, weight_tying=False, max_seq_len=4096), local HF cache.
+- Data: first 2 examples from `.data/sft/llada/openmath2-500k` test split,
+  right-truncated to T=384. mask sum = 768.
+- WoDD config: `prelude_layers=8, recurrent_layers=16, coda_layers=8,
+  t_step_eval=1, tape_dim=1024, tape_max_writes=4, tape_n_heads=8,
+  zero_init_wodd=True`.
+- Method: load LLaDA-8B-Base in fp32 → forward → save logits;
+  free; load `LLaDAWoDDModelLM.from_llada_checkpoint(..., torch_dtype=fp32,
+  t_step_eval=1, zero_init_wodd=True)` → forward(T_step=1) → compare.
+
+**Raw numbers**
+
+| metric                      | value |
+|----------------------------|------:|
+| max abs logit diff          | **0.000000e+00** |
+| mean abs logit diff         | 0.000000e+00 |
+| relative diff               | 0.0 |
+| top-5 worst per-token diff  | [0.0, 0.0, 0.0, 0.0, 0.0] |
+| atol (kill threshold)       | 1e-4 |
+
+**Side observations.**
+* `write_gates` at init: 0.16336, 0.17209 (per batch element). Above the
+  bias-init floor sigmoid(−2)≈0.119 because the gate_proj weights get the
+  default Kaiming init that adds a small positive drift on top of the bias;
+  not a concern.
+* `tape_diagnostics.tape_contrib_rel_norm` is an empty list. Correct: at
+  T_step=1 there is no second iteration, so the cross-attn read is never
+  invoked (tape is empty for k=0).
+
+**Interpretation.** Confirms WODD_PLAN.md §3.1 prediction: drop-in invariant
+holds in fp32 to floating-point exactness, not just approximately. The
+T_step=1 / zero_init pathway truly degenerates to vanilla LLaDA. Pre-
+registered kill criterion does not fire; Phase 2 is unblocked.
+
+### Phase 1b: 100-SGD-step gate dynamics
+
+**Status: defaults FAIL the gate-non-collapse assertion; recommended
+mitigation (100× higher `gate_entropy_lambda`) PASSES cleanly.**
+This is a precise replication of the failure signature WODD_PLAN.md §7
+predicts (`mean_gate` near 0 — collapse; increase entropy reg) and
+indicates the production defaults need adjustment before Phase 2.
+
+- Commit: `lpx/wodd@64e4c2b`
+  (`examples/llada_wodd: add Phase 1b gate-dynamics runner; dedupe t_step_eval`)
+- Script: `examples/llada_wodd/phase1b_gate_dynamics.py`
+- Compute: 1× H800 80 GB, bf16 mixed precision via accelerate launch
+  `--num_processes 1 --mixed_precision bf16`, gradient checkpointing on.
+- Backbone: frozen `LLaDA-8B-Base`. Trainable surface ≈ **14.73 M / 8.03 B
+  params (0.18%)** — write_head + tape_read only.
+- Data: `.data/sft/llada/openmath2-500k[train:1000,test:100]`.
+- Optimizer: AdamW, base LR 2e-5, no warmup, cosine over 100 steps decays
+  to ~0 by step 100. `wodd_lr_mult=10` → WoDD modules learn at 2e-4.
+- T_step (fixed): 2. `diag_log_every=10`. `seed=0`.
+
+**Three configurations, 100 steps each:**
+
+| run | B | sparsity_λ | entropy_λ | lr_mult | final mean_gate | final entropy | final loss_mdlm | tape_contrib | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| defaults     | 1 | 1e-2 | 1e-3 | 10 | 0.02136 | 0.10320 | 4.288 | 0.2355 | FAIL |
+| defaults     | 8 | 1e-2 | 1e-3 | 10 | **0.01238** | **0.06564** | 0.6263 | 0.5560 | **FAIL** |
+| ent×100      | 8 | 1e-2 | 1e-1 | 10 | **0.49500** | **0.68979** | 0.6195 | 0.5675 | **PASS** |
+
+**Default trajectory (B=8, 100 steps).** `mean_gate` monotonically decays
+from 0.0881 (step 10) → 0.0154 (step 60) → 0.0124 (step 100). Entropy
+mirrors this: 0.298 → 0.079 → 0.066. The sparsity penalty (1e-2·mean(g))
+dominates the early-training loss landscape before the model has had time
+to learn that tape reads are informative; the gradient pulls gate_proj.bias
+toward more negative values, the gate collapses, and the model essentially
+trains the tape_read.out_proj on a near-zero-content tape.
+
+**ent×100 trajectory (B=8, 100 steps).** With `gate_entropy_lambda=0.1`,
+`mean_gate` rises monotonically from 0.0881 → 0.46 → 0.495 and entropy
+converges to 0.690 ≈ ln(2) (max). The gate lands near 0.5 (uninformative
+but "alive"), which is the expected behaviour when entropy regularisation
+dominates: no preference, but the modules are receiving useful gradient.
+
+**Interpretation.** WODD_PLAN.md §3.1 expects `mean_gate > 0.05` and
+`gate_entropy > 0.1` after 100 steps under the trainer's defaults. The
+default `gate_entropy_lambda=1e-3` (10× weaker than `write_sparsity_lambda`)
+is insufficient to keep the gate alive at this scale — the failure
+signature predicted in §7 ("near 0 — collapse; increase entropy reg") is
+exactly what we see. The 100× higher entropy reg recommended in §5
+(Risk C: "anneal λ_entropy from high to low") restores the dynamics.
+None of this falsifies any of the pre-registered P2–P6 predictions; it
+does suggest the production `scripts/llada_wodd/run.sh` defaults should
+use `gate_entropy_lambda ≥ 1e-2` (and ideally an annealing schedule
+high→low) for Phase 2.
+
+**Deviation from plan.** The plan said B=2 ("e.g., 1 K samples"); we ran
+at B=8 to reduce single-batch loss variance (B=1 produced `loss_mdlm`
+spikes 0.008→4.29 due to MDLM timestep `t` occasionally masking ~0 tokens
+at low `t`). Both B=1 and B=8 default runs gave qualitatively the same
+gate-collapse signature, so the deviation does not change the conclusion.
+
+**Action items into Phase 2.**
+1. Bump `gate_entropy_lambda` to at least 1e-2 in
+   `scripts/llada_wodd/run.sh` and `MDLMWoDDConfig` defaults, OR
+   implement an entropy-anneal schedule (e.g., 1e-1 → 1e-3 over the first
+   10% of steps).
+2. If Phase 2 sees gate collapse again at 8×H800 effective batch (16),
+   apply the same mitigation — but report the gap honestly first.
+
+
