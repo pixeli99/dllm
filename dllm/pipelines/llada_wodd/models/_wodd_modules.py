@@ -1,25 +1,30 @@
 """
 WoDD building blocks.
 
-Three modules:
-  * WriteHead       — produce (gate g_k, content v_k) from pooled hidden state
+Four modules:
+  * WritePool       — S learned-query cross-attention pool, h -> (B, S, D)
+  * WriteHead       — per-slot (gate g_k^s, content v_k^s) from pool slots
   * TapeRead        — cross-attention from sequence positions into the tape
-  * MemoryTape      — append-only buffer holding [g_1 * v_1, ..., g_K * v_K]
+  * MemoryTape      — append-only buffer holding [g·v]_{k,s} entries
 
 Design constraints
 ------------------
 1. Identity at init: when zero_init_wodd=True, both WriteHead.content_proj and
    TapeRead.out_proj are zero-initialized so the model at step 0 is bit-
    identical to vanilla LLaDA with the same prelude/recurrent/coda split.
+   WritePool itself is *not* zero-inited; identity is preserved through the
+   v_k=0 path regardless of what the pool produces.
 2. No discrete sampling: g_k is a sigmoid scalar in [0, 1]; we multiply it
    onto v_k BEFORE append. Tape entries with g_k ~ 0 contribute ~0 to cross-
    attention via the multiplicative gate, recovering "append-only with skips"
    semantics without ST-Gumbel.
-3. Append-only: MemoryTape only supports .append() and .stack(); no in-place
-   overwrite. This is the formal claim WoDD makes vs MetaState-style
-   evolution-in-place.
+3. Append-only: MemoryTape only supports .append() / .append_many() and
+   .stack(); no in-place overwrite. This is the formal claim WoDD makes vs
+   MetaState-style evolution-in-place.
 4. Stateless training: the tape lives for one forward pass only. Across
    training samples / forward calls it is freshly initialized.
+5. Multi-slot writes: each inner step writes S tape entries (one per pool
+   slot) instead of one global summary. Total tape size is K * S.
 """
 
 from __future__ import annotations
@@ -49,6 +54,9 @@ def masked_mean(
 
     Returns:
         (B, D)
+
+    NOTE: kept for backwards-compatibility / single-slot fallback. The
+    multi-slot path uses WritePool below.
     """
     if attention_mask is None:
         return h.mean(dim=1)
@@ -59,16 +67,115 @@ def masked_mean(
 
 
 # ---------------------------------------------------------------------------
+# WritePool — multi-slot cross-attention pool
+# ---------------------------------------------------------------------------
+
+class WritePool(nn.Module):
+    """S learned query vectors cross-attend over the sequence to produce S
+    summary slots. Each slot becomes one tape entry candidate via WriteHead.
+
+    Why this replaces masked_mean
+    -----------------------------
+    Single-slot masked_mean compresses (B, T, D) to one (B, D) per inner step,
+    so K steps yield K tape entries -- a hard information bottleneck. With S
+    learned queries the model decides *which* aspects of the sequence to write
+    per step, and tape capacity becomes K * S.
+
+    Initialization
+    --------------
+    - queries: orthogonal init breaks symmetry; without this all S slots would
+      pool identical content and collapse to single-slot behavior.
+    - out_proj: not zero-initialized here. The step-0 identity-at-init
+      guarantee comes from WriteHead.content_proj=0 (which makes v_k=0
+      regardless of what pool produces); zero-ing WritePool would only make
+      gradients vanish into it.
+
+    Forward
+    -------
+        h: (B, T, d_model)
+        attention_mask: (B, T) -- pad positions get -inf attn bias
+        -> pool: (B, n_slots, d_model)
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_slots: int,
+        n_heads: int = 8,
+        init_device: Optional[str] = None,
+    ):
+        super().__init__()
+        assert d_model % n_heads == 0, (
+            f"d_model ({d_model}) must be divisible by n_heads ({n_heads})"
+        )
+        self.d_model = int(d_model)
+        self.n_slots = int(n_slots)
+        self.n_heads = int(n_heads)
+        self.head_dim = d_model // n_heads
+
+        # Per-slot learnable queries. Orthogonal init keeps slots distinct.
+        self.queries = nn.Parameter(
+            torch.empty(self.n_slots, self.d_model, device=init_device)
+        )
+        with torch.no_grad():
+            nn.init.orthogonal_(self.queries)
+
+        # LN on queries lives in the parameter space (not h's LN space), so we
+        # keep it separate from k_ln on the sequence side.
+        self.q_ln = nn.LayerNorm(d_model, device=init_device)
+        self.kv_ln = nn.LayerNorm(d_model, device=init_device)
+
+        self.q_proj = nn.Linear(d_model, d_model, device=init_device)
+        self.k_proj = nn.Linear(d_model, d_model, device=init_device)
+        self.v_proj = nn.Linear(d_model, d_model, device=init_device)
+        self.out_proj = nn.Linear(d_model, d_model, device=init_device)
+
+    def forward(
+        self,
+        h: torch.Tensor,                                  # (B, T, d_model)
+        attention_mask: Optional[torch.Tensor] = None,    # (B, T)
+    ) -> torch.Tensor:
+        B, T, _ = h.shape
+        S = self.n_slots
+
+        q = self.q_proj(self.q_ln(self.queries))          # (S, d_model)
+        q = q.unsqueeze(0).expand(B, -1, -1)              # (B, S, d_model)
+        kv = self.kv_ln(h)
+        k = self.k_proj(kv)                               # (B, T, d_model)
+        v = self.v_proj(kv)                               # (B, T, d_model)
+
+        q = q.view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+
+        attn = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if attention_mask is not None:
+            # (B, T) -> additive bias (B, 1, 1, T) of 0 / -inf
+            am = attention_mask.to(attn.dtype)
+            bias = (1.0 - am) * torch.finfo(attn.dtype).min
+            attn = attn + bias.unsqueeze(1).unsqueeze(1)
+        attn = F.softmax(attn, dim=-1)
+
+        out = torch.matmul(attn, v)                       # (B, h, S, hd)
+        out = out.transpose(1, 2).contiguous().view(B, S, self.d_model)
+        out = self.out_proj(out)                          # (B, S, d_model)
+        return out
+
+
+# ---------------------------------------------------------------------------
 # WriteHead
 # ---------------------------------------------------------------------------
 
 class WriteHead(nn.Module):
     """Decide whether and what to write to the tape this inner step.
 
-    Forward:
-        pool: (B, d_model)  -- pooled hidden state of visible tokens
-        -> g: (B, 1)        sigmoid gate, range [0, 1]
-        -> v: (B, tape_dim) content vector
+    Forward (broadcasts over any leading dims, so multi-slot pool just works):
+        pool: (B, ..., d_model)
+        -> g: (B, ..., 1)         sigmoid gate per slot, range [0, 1]
+        -> v: (B, ..., tape_dim)  content vector per slot
+
+    For multi-slot WritePool, `...` is the slot axis S so we get per-slot
+    (g, v) without any code change in this class.
 
     Tape entry that ultimately gets appended is `g * v`, so g ~ 0 means a
     near-zero contribution to subsequent cross-attention.
@@ -96,6 +203,13 @@ class WriteHead(nn.Module):
         # regularizer will push down further if needed.
         with torch.no_grad():
             self.gate_proj.bias.fill_(float(gate_bias_init))
+            # Zero-init gate_proj.weight so all S slots start at the same
+            # sigmoid(bias) value regardless of pool input. Without this,
+            # kaiming init + multi-slot pool drives some slot logits into
+            # the bf16-saturating regime within one update step (sigmoid
+            # -> 1.0, (1-g)*log(1-g) -> NaN). Sparsity reg breaks the
+            # weight=0 symmetry on the first non-trivial gradient.
+            self.gate_proj.weight.zero_()
 
         if zero_init:
             # Zero-init content output so v_k = 0 at init -> tape stores all-
@@ -150,6 +264,38 @@ class MemoryTape:
             )
         self._entries.append(gated_content)
         self._gates.append(gate)
+
+    def append_many(
+        self,
+        gated_content: torch.Tensor,    # (B, S, tape_dim)
+        gate: torch.Tensor,             # (B, S, 1)
+    ) -> None:
+        """Append S entries at once (one inner step of a multi-slot writer).
+
+        Entries are unbinded along dim=1 so each slot becomes its own tape
+        position. Ordering within a step is the slot index 0..S-1.
+        """
+        assert gated_content.dim() == 3, (
+            f"append_many expects (B, S, tape_dim); got {tuple(gated_content.shape)}"
+        )
+        B, S, D = gated_content.shape
+        assert B == self.batch_size and D == self.tape_dim, (
+            f"shape mismatch: tape=({self.batch_size}, ?, {self.tape_dim}), "
+            f"got ({B}, {S}, {D})"
+        )
+        assert gate.shape == (B, S, 1), (
+            f"gate must be (B, S, 1); got {tuple(gate.shape)}"
+        )
+        if len(self._entries) + S > self.max_writes:
+            raise RuntimeError(
+                f"MemoryTape would overflow: have {len(self._entries)} entries, "
+                f"adding {S}, max_writes={self.max_writes}"
+            )
+        # Unbind so each slot becomes a separate (B, D) entry; preserves
+        # autograd through the original (B, S, D) tensor.
+        for s in range(S):
+            self._entries.append(gated_content[:, s, :])
+            self._gates.append(gate[:, s, :])
 
     def __len__(self) -> int:
         return len(self._entries)

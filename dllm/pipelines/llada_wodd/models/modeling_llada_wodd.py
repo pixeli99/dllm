@@ -43,6 +43,7 @@ from ._wodd_modules import (
     TapeRead,
     WoDDStepStats,
     WriteHead,
+    WritePool,
     masked_mean,
 )
 from .configuration_llada_wodd import LLaDAWoDDConfig
@@ -56,7 +57,7 @@ from .configuration_llada_wodd import LLaDAWoDDConfig
 class WoDDLLaDAOutput(CausalLMOutputWithPast):
     """CausalLMOutputWithPast + tape diagnostics for sparsity / entropy loss."""
 
-    write_gates: Optional[torch.Tensor] = None      # (B, T_step, 1)
+    write_gates: Optional[torch.Tensor] = None      # (B, T_step * S, 1)
     tape_diagnostics: Optional[Dict[str, Any]] = None
 
 
@@ -72,12 +73,12 @@ class LLaDAWoDDModel(LLaDAModel):
         recurrent:  blocks[P:P+R]    (iterated T_step times, weight-shared)
         coda:       blocks[P+R:P+R+C]
 
-    Each inner iteration k = 1..T_step:
+    Each inner iteration k = 1..T_step (multi-slot write):
         if tape non-empty: h <- h + TapeRead(h, tape)
         h <- recurrent_blocks(h)
-        pool = masked_mean(h)
-        g_k, v_k = WriteHead(pool)
-        tape.append(g_k * v_k, gate=g_k)
+        pool = WritePool(h)                    # (B, S, d_model)
+        g_k, v_k = WriteHead(pool)             # (B, S, 1), (B, S, tape_dim)
+        tape.append_many(g_k * v_k, gate=g_k)  # appends S entries
     """
 
     config_class = LLaDAWoDDConfig
@@ -108,6 +109,12 @@ class LLaDAWoDDModel(LLaDAModel):
             max_writes=config.tape_max_writes,
             n_heads=config.tape_n_heads,
             zero_init=config.zero_init_wodd,
+            init_device=dev,
+        )
+        self.write_pool = WritePool(
+            d_model=d,
+            n_slots=int(config.write_slots),
+            n_heads=int(config.write_pool_n_heads),
             init_device=dev,
         )
         self.write_head = WriteHead(
@@ -147,10 +154,12 @@ class LLaDAWoDDModel(LLaDAModel):
         if T_step is None:
             T_step = int(self.config.t_step_eval)
         T_step = max(1, int(T_step))
-        if T_step > int(self.config.tape_max_writes):
+        # Multi-slot: total tape entries this forward = T_step * write_slots.
+        S = int(self.config.write_slots)
+        if T_step * S > int(self.config.tape_max_writes):
             raise ValueError(
-                f"T_step={T_step} exceeds tape_max_writes="
-                f"{self.config.tape_max_writes}"
+                f"T_step * write_slots = {T_step} * {S} = {T_step * S} "
+                f"exceeds tape_max_writes={self.config.tape_max_writes}"
             )
 
         # ------------- Embeddings -------------
@@ -228,10 +237,10 @@ class LLaDAWoDDModel(LLaDAModel):
                     h, attention_bias=eff_bias, layer_past=None, use_cache=False
                 )
 
-            # 3. Pool and decide write
-            pool = masked_mean(h, attention_mask)                 # (B, d_model)
-            g_k, v_k = self.write_head(pool)                      # (B,1), (B,d_tape)
-            tape.append(g_k * v_k, gate=g_k)
+            # 3. Pool and decide write (multi-slot)
+            pool = self.write_pool(h, attention_mask)             # (B, S, d_model)
+            g_k, v_k = self.write_head(pool)                      # (B,S,1), (B,S,d_tape)
+            tape.append_many(g_k * v_k, gate=g_k)                 # appends S entries
 
         # ------------- Coda -------------
         x = h

@@ -76,6 +76,7 @@ class MDLMWoDDConfig(MDLMConfig):
 _WODD_PARAM_PREFIXES = (
     "model.tape_read.",
     "model.write_head.",
+    "model.write_pool.",
 )
 
 
@@ -324,9 +325,15 @@ class MDLMWoDDTrainer(MDLMTrainer):
         loss_mdlm = token_nll.sum()
 
         # 5. WoDD regularizers
-        # write_gates: (B, T_step, 1)
+        # write_gates: (B, T_step * S, 1) — flattened over inner steps and
+        # write slots. Cast to fp32 because bf16 cannot represent
+        # 1 - 1e-6 distinctly from 1.0, so the clamp here would silently
+        # fail in bf16 and the (1-p)*log(1-p) term becomes 0*(-inf)=NaN
+        # whenever any gate saturates. fp32 keeps the clamp meaningful.
         gates = outputs.write_gates
-        gates_flat = gates.squeeze(-1).clamp(min=1e-6, max=1.0 - 1e-6)  # (B, T_step)
+        gates_flat = gates.squeeze(-1).float().clamp(
+            min=1e-4, max=1.0 - 1e-4
+        )  # (B, T_step * S)
 
         # Sparsity: penalize mean gate value. Differentiable.
         loss_sparsity = gates_flat.mean()

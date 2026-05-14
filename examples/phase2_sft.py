@@ -96,7 +96,7 @@ ARM_TRAINABLE_PREFIXES = {
     "latts":     (),                                    # nothing extra
     "metastate": ("model.state_init.", "model.state_read.", "model.state_update."),
     "dpad":      ("model.scratchpad",),                 # single tensor
-    "wodd":      ("model.write_head.", "model.tape_read."),
+    "wodd":      ("model.write_head.", "model.tape_read.", "model.write_pool."),
 }
 
 
@@ -113,7 +113,10 @@ DEFAULT_ARM_KWARGS = {
     "dpad":      dict(prelude_layers=8, recurrent_layers=16, coda_layers=8,
                       dpad_len=512, zero_init_dpad=True),
     "wodd":      dict(prelude_layers=8, recurrent_layers=16, coda_layers=8,
-                      t_step_eval=4, tape_dim=1024, tape_max_writes=16,
+                      t_step_eval=4, tape_dim=1024,
+                      # multi-slot: K*S = 4*16 = 64 tape entries per forward
+                      tape_max_writes=64,
+                      write_slots=16, write_pool_n_heads=8,
                       tape_n_heads=8, zero_init_wodd=True),
 }
 
@@ -138,7 +141,7 @@ class ArmArguments:
 
 @dataclass
 class ModelArguments(dllm.utils.ModelArguments):
-    model_name_or_path: str = "GSAI-ML/LLaDA-8B-Base"
+    model_name_or_path: str = "/lustre/projects/polyullm/lipengxiang_tmp/LLaDA-8B-Instruct"
 
 
 @dataclass

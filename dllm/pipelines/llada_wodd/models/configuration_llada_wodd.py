@@ -74,11 +74,19 @@ class LLaDAWoDDConfig(LLaDAConfig):
         # attention is cheap. Default ~ d_model / 4 to match WriteHead bottleneck.
         tape_dim: int = 1024,
         # Max number of writes per forward. Hard cap so cross-attn KV size is
-        # bounded. The model may emit g_k=0 to "skip" a write even before this.
-        tape_max_writes: int = 16,
+        # bounded. With multi-slot writes the per-forward tape size is
+        # t_step * write_slots, so this must be >= t_step_eval * write_slots.
+        tape_max_writes: int = 64,
         # Tape cross-attention heads. Independent from main attention heads so
         # tape attention stays small.
         tape_n_heads: int = 8,
+        # ---- Multi-slot write pool ----
+        # Number of latent slots written per inner step. S=1 recovers the
+        # original single-summary behavior. S>1 lets each step write multiple
+        # tape entries chosen by learned queries over the sequence.
+        write_slots: int = 16,
+        # Heads for the learned-query cross-attention pool.
+        write_pool_n_heads: int = 8,
         # ---- Identity-at-init guarantee ----
         # When True, write_content output projection AND tape_read output
         # projection are zero-initialized so the network at step 0 is exactly
@@ -97,14 +105,23 @@ class LLaDAWoDDConfig(LLaDAConfig):
         self.tape_dim = int(tape_dim)
         self.tape_max_writes = int(tape_max_writes)
         self.tape_n_heads = int(tape_n_heads)
+        self.write_slots = int(write_slots)
+        self.write_pool_n_heads = int(write_pool_n_heads)
         self.zero_init_wodd = bool(zero_init_wodd)
 
         assert self.t_step_eval >= 1
-        assert self.tape_max_writes >= self.t_step_eval, (
-            f"tape_max_writes ({self.tape_max_writes}) must be >= t_step_eval "
-            f"({self.t_step_eval})"
+        assert self.write_slots >= 1
+        assert self.tape_max_writes >= self.t_step_eval * self.write_slots, (
+            f"tape_max_writes ({self.tape_max_writes}) must be >= "
+            f"t_step_eval * write_slots "
+            f"({self.t_step_eval} * {self.write_slots} = "
+            f"{self.t_step_eval * self.write_slots})"
         )
         assert self.tape_dim % self.tape_n_heads == 0, (
             f"tape_dim ({self.tape_dim}) must be divisible by tape_n_heads "
             f"({self.tape_n_heads})"
+        )
+        assert self.d_model % self.write_pool_n_heads == 0, (
+            f"d_model ({self.d_model}) must be divisible by "
+            f"write_pool_n_heads ({self.write_pool_n_heads})"
         )
