@@ -478,3 +478,48 @@ the WoDD-only cell would not test the pre-registered predictions.
 Their **infrastructure** is in place and tested at small scale (see
 "Phase 2-6 launcher + eval infrastructure" section above) but no
 training/eval has been executed for them in this session.
+
+### Phase 2 numbers — WoDD seed=0 GSM8K (2026-05-14)
+
+**GSM8K (gsm8k_cot, 5-shot, greedy, cfg_scale=0.0, max_new_tokens=512,
+n=1319 full test set)**:
+
+| metric          | exact_match       | stderr            |
+|-----------------|-------------------|-------------------|
+| flexible-extract| 0.13874147081122062 | 0.009521649920798143 |
+| strict-match    | 0.009097801364670205 | 0.002615326510775672 |
+
+Eval wall time: `10174.4s ≈ 2:50h` on 8×H800 at
+`per_device_batch_size=1, max_new_tokens=512, steps=512, block_size=512`.
+Raw JSON: `.eval/phase2/wodd/seed0/gsm8k_cot_2026-05-14T06-01-06.json`.
+
+**MATH-500 (minerva_math)**: **skipped** — `lm-eval[math]` extras are
+not installed in the cluster env (the task requires
+`antlr4-python3-runtime==4.11`, `sympy`, `math_verify`). The user-stated
+constraint "环境已经配好了，不要修改环境了" forbids `pip install`,
+so MATH-500 is unavailable via the harness in this env. Re-running with
+`pip install -e lm-evaluation-harness[math]` would unblock it on a
+future session.
+
+**HumanEval / MBPP**: **not run** in the same eval batch — `set -e` in
+`scripts/phase2/eval_arm.sh` propagated the minerva_math failure and
+killed the script before humaneval/mbpp tasks ran. The script invokes
+them after minerva. They can be re-run independently against the same
+checkpoint, but with the comparison-first strategy (see below) they
+are deferred until at least one MetaState GSM8K number lands so the
+P2-go/no-go gap is testable.
+
+### Comparison-first strategy (deviation, with reason)
+
+Per WODD_PLAN.md the P2 headline prediction is GSM8K-specific:
+"P2-go/no-go: WoDD ≥ MetaState + 3 pp on GSM8K." With the realized
+per-cell cost of ~14 GPU-h, completing all 4 tasks for WoDD-only
+would consume ~9 more GPU-h without producing any cross-arm test;
+running MetaState seed=0 (~2 h train + ~3 h GSM8K eval = ~5 h)
+instead **directly tests the headline prediction**.
+
+Decision taken: launch MetaState seed=0 training **now** on the same
+config as the WoDD pilot (`200K OpenMath × 1 epoch, lr=2e-5,
+warmup_ratio=0.0, per_device_bsz=2, grad_accum=1, bf16+FSDP,
+gradient_checkpointing=True`), then GSM8K eval at the same decoding
+config. Result lands in a follow-up commit.
