@@ -65,13 +65,15 @@ export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_DEBUG=warn
 
-COMMON_ARGS="--model ${MODEL_NAME} --apply_chat_template"
+COMMON_ARGS="--model ${MODEL_NAME}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
 COMMON_MODEL_ARGS_GREEDY="pretrained=${CKPT},max_new_tokens=512,steps=512,block_size=512,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348]"
 COMMON_MODEL_ARGS_CODE="pretrained=${CKPT},max_new_tokens=512,steps=512,block_size=512,cfg_scale=0.0,suppress_tokens=[126081],begin_suppress_tokens=[]"
 
 # 1. GSM8K (CoT)
 accelerate launch --num_processes "${NUM_GPU}" "${EVAL_ENTRY}" \
-  --tasks gsm8k_cot --num_fewshot 5 ${COMMON_ARGS} \
+  --tasks gsm8k_cot --num_fewshot 0 ${COMMON_ARGS} \
+  --batch_size "${BATCH_SIZE}" \
   --model_args "${COMMON_MODEL_ARGS_GREEDY}" \
   --output_path "${OUTPUT_DIR}/gsm8k_cot.json" \
   --seed "${SEED}"
@@ -79,6 +81,7 @@ accelerate launch --num_processes "${NUM_GPU}" "${EVAL_ENTRY}" \
 # 2. MATH-500 (proxy via minerva_math)
 accelerate launch --num_processes "${NUM_GPU}" "${EVAL_ENTRY}" \
   --tasks minerva_math --num_fewshot 4 ${COMMON_ARGS} \
+  --batch_size "${BATCH_SIZE}" \
   --model_args "${COMMON_MODEL_ARGS_GREEDY}" \
   --output_path "${OUTPUT_DIR}/minerva_math.json" \
   --seed "${SEED}"
@@ -86,6 +89,7 @@ accelerate launch --num_processes "${NUM_GPU}" "${EVAL_ENTRY}" \
 # 3. HumanEval (instruct, needs unsafe-code)
 accelerate launch --num_processes "${NUM_GPU}" "${EVAL_ENTRY}" \
   --tasks humaneval_instruct_llada --num_fewshot 0 ${COMMON_ARGS} \
+  --batch_size "${BATCH_SIZE}" \
   --model_args "${COMMON_MODEL_ARGS_CODE}" \
   --output_path "${OUTPUT_DIR}/humaneval.json" \
   --confirm_run_unsafe_code \
@@ -94,6 +98,7 @@ accelerate launch --num_processes "${NUM_GPU}" "${EVAL_ENTRY}" \
 # 4. MBPP
 accelerate launch --num_processes "${NUM_GPU}" "${EVAL_ENTRY}" \
   --tasks mbpp_instruct_llada --num_fewshot 3 ${COMMON_ARGS} \
+  --batch_size "${BATCH_SIZE}" \
   --model_args "pretrained=${CKPT},max_new_tokens=256,steps=256,block_size=256,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348]" \
   --output_path "${OUTPUT_DIR}/mbpp.json" \
   --confirm_run_unsafe_code \
