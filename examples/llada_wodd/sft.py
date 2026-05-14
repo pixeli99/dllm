@@ -48,7 +48,9 @@ class WoDDArguments:
     tape_dim: int = 1024
     tape_max_writes: int = 16
     tape_n_heads: int = 8
-    t_step_eval: int = 4
+    # NOTE: t_step_eval lives on MDLMWoDDConfig (the TrainingArguments parent);
+    # the model-config value is mirrored from training_args.t_step_eval at
+    # build time so the trainer and the model agree.
     zero_init_wodd: bool = True
 
 
@@ -121,7 +123,10 @@ def train():
             tape_dim=wodd_args.tape_dim,
             tape_max_writes=wodd_args.tape_max_writes,
             tape_n_heads=wodd_args.tape_n_heads,
-            t_step_eval=wodd_args.t_step_eval,
+            # Mirror trainer's t_step_eval into the model config so the two
+            # never drift. (Originally duplicated on WoDDArguments, which
+            # conflicted with MDLMWoDDConfig at argparse time.)
+            t_step_eval=training_args.t_step_eval,
             zero_init_wodd=wodd_args.zero_init_wodd,
         )
         model = LLaDAWoDDModelLM.from_llada_checkpoint(
