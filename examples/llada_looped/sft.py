@@ -18,7 +18,8 @@ Two variants selectable at the command line:
       h_1 = R(h_0)                          # vanilla first pass
       h_r = R(RecursiveLink(h_{r-1}))       # feedback transition (r >= 2)
       # Optional: --use_damped_update True commits feedback transitions via
-      # h_r = h_{r-1} + damping_alpha * (proposed_h_r - h_{r-1}).
+      # h_r = h_{r-1} + alpha_r * (proposed_h_r - h_{r-1}), where alpha_r
+      # can be constant, normalized by T_rec, or decayed across feedback steps.
 
       Default training T_rec ~ Uniform{2..6} (T=1 has no link gradient).
       Default trainable surface: ONLY recursive_link.* (~33M params).
@@ -90,8 +91,11 @@ class LoopArguments:
     mu_rec_eval: int = 4
     # ---- Optional feedback damping ----
     use_damped_update: bool = False
+    damping_schedule: str = "constant"
     damping_alpha: float = 0.5
     learn_damping_alpha: bool = False
+    damping_tau: float = 1.0
+    damping_decay_beta: float = 0.0
 
 
 @dataclass
@@ -173,8 +177,11 @@ def train():
             use_latent_feedback=loop_args.use_latent_feedback,
             mu_rec_eval=loop_args.mu_rec_eval,
             use_damped_update=loop_args.use_damped_update,
+            damping_schedule=loop_args.damping_schedule,
             damping_alpha=loop_args.damping_alpha,
             learn_damping_alpha=loop_args.learn_damping_alpha,
+            damping_tau=loop_args.damping_tau,
+            damping_decay_beta=loop_args.damping_decay_beta,
         )
         model = LLaDALoopedModelLM.from_llada_checkpoint(
             model_args.model_name_or_path, **loop_kwargs

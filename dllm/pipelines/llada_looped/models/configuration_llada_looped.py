@@ -49,12 +49,18 @@ class LLaDALoopedConfig(LLaDAConfig):
         mu_rec_eval: int = 4,
         # ---- Optional feedback damping ----
         # When enabled, only feedback iterations (r >= 1) commit the proposed
-        # recurrent state through:
-        #   h_next = h_prev + damping_alpha * (R(link(h_prev)) - h_prev)
+        # recurrent state through h_next = h_prev + alpha * (proposal - h_prev).
+        # Schedules:
+        #   constant:   alpha = damping_alpha
+        #   normalized: alpha = damping_tau / (T_rec - 1)
+        #   decay:      sum_r alpha_r = damping_tau with exponential decay
         # The first pass is never damped, preserving T_rec=1 equivalence.
         use_damped_update: bool = False,
+        damping_schedule: str = "constant",
         damping_alpha: float = 0.5,
         learn_damping_alpha: bool = False,
+        damping_tau: float = 1.0,
+        damping_decay_beta: float = 0.0,
         **kwargs,
     ):
         kwargs.setdefault("architectures", ["LLaDALoopedModelLM"])
@@ -73,9 +79,28 @@ class LLaDALoopedConfig(LLaDAConfig):
 
         self.mu_rec_eval = int(mu_rec_eval)
         self.use_damped_update = bool(use_damped_update)
+        self.damping_schedule = str(damping_schedule).lower()
         self.damping_alpha = float(damping_alpha)
         self.learn_damping_alpha = bool(learn_damping_alpha)
+        self.damping_tau = float(damping_tau)
+        self.damping_decay_beta = float(damping_decay_beta)
+        valid_schedules = {"constant", "normalized", "decay"}
+        if self.damping_schedule not in valid_schedules:
+            raise ValueError(
+                f"damping_schedule must be one of {sorted(valid_schedules)}, "
+                f"got {self.damping_schedule!r}"
+            )
         if not 0.0 < self.damping_alpha <= 1.0:
             raise ValueError(
                 f"damping_alpha must be in (0, 1], got {self.damping_alpha}"
+            )
+        if self.damping_tau <= 0.0:
+            raise ValueError(f"damping_tau must be > 0, got {self.damping_tau}")
+        if self.damping_decay_beta < 0.0:
+            raise ValueError(
+                f"damping_decay_beta must be >= 0, got {self.damping_decay_beta}"
+            )
+        if self.learn_damping_alpha and self.damping_schedule != "constant":
+            raise ValueError(
+                "learn_damping_alpha is only supported for constant damping_schedule"
             )

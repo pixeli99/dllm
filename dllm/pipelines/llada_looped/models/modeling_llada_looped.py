@@ -22,7 +22,8 @@ KEY ARCHITECTURAL CHOICES (V2.1-a):
           proposed = R(RecursiveLink(h_{r-1}))
           h_r = proposed                     # default feedback transition
           # optional:
-          # h_r = h_{r-1} + damping_alpha * (proposed - h_{r-1})
+          # h_r = h_{r-1} + alpha_r * (proposed - h_{r-1})
+          # where alpha_r can be constant, normalized by T_rec, or decayed.
 
       RecursiveLink(h) = h + proj2(GELU(proj1(pre_ln(h))))
       proj2 is zero-initialized so the loop body starts as V1 dynamics
@@ -164,13 +165,54 @@ class LLaDALoopedModel(LLaDAModel):
             self.recursive_link = RecursiveLink(
                 d_model=d, init_device=dev
             )
-        if config.use_damped_update and getattr(config, "learn_damping_alpha", False):
+        if (
+            config.use_damped_update
+            and config.damping_schedule == "constant"
+            and getattr(config, "learn_damping_alpha", False)
+        ):
             alpha = float(config.damping_alpha)
             alpha = min(max(alpha, 1e-6), 1.0 - 1e-6)
             logit = math.log(alpha / (1.0 - alpha))
             self.damping_alpha_logit = nn.Parameter(
                 torch.tensor(logit, device=dev)
             )
+
+    def _feedback_alpha(self, r: int, T_rec: int, ref: torch.Tensor) -> torch.Tensor:
+        """Return the damping step size for feedback iteration r."""
+        schedule = str(getattr(self.config, "damping_schedule", "constant")).lower()
+        dtype = ref.dtype
+        device = ref.device
+
+        if schedule == "constant":
+            if bool(getattr(self.config, "learn_damping_alpha", False)):
+                alpha = torch.sigmoid(self.damping_alpha_logit).to(
+                    device=device,
+                    dtype=dtype,
+                )
+            else:
+                alpha = torch.tensor(
+                    float(getattr(self.config, "damping_alpha", 1.0)),
+                    device=device,
+                    dtype=dtype,
+                )
+        else:
+            feedback_steps = max(int(T_rec) - 1, 1)
+            tau = torch.tensor(
+                float(getattr(self.config, "damping_tau", 1.0)),
+                device=device,
+                dtype=dtype,
+            )
+            if schedule == "normalized":
+                alpha = tau / float(feedback_steps)
+            elif schedule == "decay":
+                beta = float(getattr(self.config, "damping_decay_beta", 0.0))
+                idx = torch.arange(feedback_steps, device=device, dtype=torch.float32)
+                weights = torch.softmax(-beta * idx, dim=0).to(dtype=dtype)
+                alpha = tau * weights[int(r) - 1]
+            else:
+                raise ValueError(f"Unknown damping_schedule: {schedule}")
+
+        return alpha.clamp(0.0, 1.0)
 
     # ------------------------------------------------------------------
     # Forward
@@ -267,19 +309,13 @@ class LLaDALoopedModel(LLaDAModel):
         diag_residual: List[torch.Tensor] = []
         diag_raw_residual: List[torch.Tensor] = []
         diag_adapter_update: List[torch.Tensor] = []  # only logged for r >= 1
+        diag_damping_alpha: List[torch.Tensor] = []  # only logged for r >= 1
 
         h = e
         prev_h: Optional[torch.Tensor] = None
         use_damped_update = bool(getattr(self.config, "use_damped_update", False))
         learn_damping_alpha = bool(getattr(self.config, "learn_damping_alpha", False))
-        if use_damped_update and learn_damping_alpha:
-            damping_alpha = torch.sigmoid(self.damping_alpha_logit).to(dtype=x.dtype)
-        else:
-            damping_alpha = torch.tensor(
-                float(getattr(self.config, "damping_alpha", 1.0)),
-                device=x.device,
-                dtype=x.dtype,
-            )
+        damping_schedule = str(getattr(self.config, "damping_schedule", "constant"))
 
         for r in range(T_rec):
             if r == 0:
@@ -306,7 +342,10 @@ class LLaDALoopedModel(LLaDAModel):
 
             h_next = h_out
             if r > 0 and use_damped_update:
+                damping_alpha = self._feedback_alpha(r=r, T_rec=T_rec, ref=h)
                 h_next = h + damping_alpha * (h_out - h)
+                if output_loop_diagnostics:
+                    diag_damping_alpha.append(damping_alpha.detach())
 
             # Diagnostics (no_grad). Records ||h_r - h_{r-1}|| / ||h_{r-1}||
             # for r >= 1 (i.e., len = T_rec - 1).
@@ -356,9 +395,18 @@ class LLaDALoopedModel(LLaDAModel):
                     "residual_norm": diag_residual,
                     "raw_residual_norm": diag_raw_residual,
                     "adapter_update_norm": diag_adapter_update,
+                    "damping_alpha": diag_damping_alpha,
                     "T_rec": T_rec,
                     "use_damped_update": use_damped_update,
-                    "damping_alpha": damping_alpha,
+                    "damping_schedule_id": {
+                        "constant": 0.0,
+                        "normalized": 1.0,
+                        "decay": 2.0,
+                    }.get(damping_schedule, -1.0),
+                    "damping_tau": float(getattr(self.config, "damping_tau", 1.0)),
+                    "damping_decay_beta": float(
+                        getattr(self.config, "damping_decay_beta", 0.0)
+                    ),
                     "learn_damping_alpha": learn_damping_alpha,
                 }
                 if output_loop_diagnostics
@@ -423,7 +471,8 @@ class LLaDALoopedModelLM(LLaDAModelLM):
             **loop_kwargs: forwarded to LLaDALoopedConfig
                 (prelude_layers, recurrent_layers, coda_layers,
                  use_latent_feedback, mu_rec_eval, use_damped_update,
-                 damping_alpha, learn_damping_alpha).
+                 damping_schedule, damping_alpha, learn_damping_alpha,
+                 damping_tau, damping_decay_beta).
         """
         from dllm.pipelines.llada.models.configuration_llada import LLaDAConfig
         from dllm.pipelines.llada.models.modeling_llada import LLaDAModelLM

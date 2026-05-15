@@ -20,6 +20,7 @@ Extends MDLMTrainer for the latent-feedback looped LLaDA:
          loop/residual_norm_iter{r}    -- ||h_r - h_{r-1}|| / ||h_{r-1}||
          loop/raw_residual_norm_iter{r} -- undamped proposal movement, if enabled
          loop/adapter_update_norm_iter{r}
+         loop/damping_alpha_iter{r}
      Use these to diagnose fixed-point convergence and adapter activity.
 
 Run:
@@ -361,7 +362,12 @@ class MDLMLoopedTrainer(MDLMTrainer):
 
         log_dict["loop/T_rec"] = float(T_rec)
 
-        for key in ("residual_norm", "raw_residual_norm", "adapter_update_norm"):
+        for key in (
+            "residual_norm",
+            "raw_residual_norm",
+            "adapter_update_norm",
+            "damping_alpha",
+        ):
             seq = diag.get(key, None)
             if not seq:
                 continue
@@ -371,7 +377,13 @@ class MDLMLoopedTrainer(MDLMTrainer):
                 except Exception:
                     pass
 
-        for key in ("use_damped_update", "damping_alpha", "learn_damping_alpha"):
+        for key in (
+            "use_damped_update",
+            "damping_schedule_id",
+            "damping_tau",
+            "damping_decay_beta",
+            "learn_damping_alpha",
+        ):
             value = diag.get(key, None)
             if value is None:
                 continue
