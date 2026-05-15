@@ -17,17 +17,19 @@ cd "${repo_root}"
 accelerate launch \
   --config_file scripts/accelerate_configs/zero2.yaml \
   examples/llada_looped/sft.py \
-  --output_dir .models/loop_belief/openmath2-v2.1a-stage1 \
+  --output_dir .models/loop_belief/openmath2-v2.1a-stage1-ins \
   --dataset_args ".data/sft/llada/openmath2-500k" \
   --load_preprocessed_data True \
   --num_train_epochs 3 \
   --max_steps 1000 \
-  --per_device_train_batch_size 2 \
-  --gradient_accumulation_steps 8 \
+  --model_name_or_path /lustre/projects/polyullm/lipengxiang_tmp/LLaDA-8B-Instruct \
+  --per_device_train_batch_size 4 \
+  --gradient_accumulation_steps 4 \
+  --group_by_length False \
   --max_length 1024 \
   --learning_rate 5e-4 \
   --report_to tensorboard \
-  --logging_dir .models/loop_belief/openmath2-v2.1a-stage1/tb \
+  --logging_dir .models/loop_belief/openmath2-v2.1a-stage1-ins/tb \
   --save_steps 0.25 \
   --save_total_limit 3 \
   --save_only_model False \

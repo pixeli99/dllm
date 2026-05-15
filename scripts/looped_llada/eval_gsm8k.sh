@@ -15,8 +15,8 @@ cd "${repo_root}"
 
 checkpoint=""
 t_rec=""
-num_gpu=4
-batch_size=1
+num_gpu=8
+batch_size=4
 num_fewshot=0
 max_new_tokens=256
 steps=256

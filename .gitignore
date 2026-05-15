@@ -132,8 +132,16 @@ dmypy.json
 
 # Others
 /.vscode/
+/.claude/settings.local.json
 /tmp/
 /.data/
+/.eval/
 /wandb/
 /.logs/
+/logs/
 /.models/
+
+# Local ad-hoc scripts
+/run.sh
+/lab.sh
+/eval_math_verify_jsonl.py
