@@ -164,6 +164,13 @@ class LLaDALoopedModel(LLaDAModel):
             self.recursive_link = RecursiveLink(
                 d_model=d, init_device=dev
             )
+        if config.use_damped_update and getattr(config, "learn_damping_alpha", False):
+            alpha = float(config.damping_alpha)
+            alpha = min(max(alpha, 1e-6), 1.0 - 1e-6)
+            logit = math.log(alpha / (1.0 - alpha))
+            self.damping_alpha_logit = nn.Parameter(
+                torch.tensor(logit, device=dev)
+            )
 
     # ------------------------------------------------------------------
     # Forward
@@ -264,7 +271,15 @@ class LLaDALoopedModel(LLaDAModel):
         h = e
         prev_h: Optional[torch.Tensor] = None
         use_damped_update = bool(getattr(self.config, "use_damped_update", False))
-        damping_alpha = float(getattr(self.config, "damping_alpha", 1.0))
+        learn_damping_alpha = bool(getattr(self.config, "learn_damping_alpha", False))
+        if use_damped_update and learn_damping_alpha:
+            damping_alpha = torch.sigmoid(self.damping_alpha_logit).to(dtype=x.dtype)
+        else:
+            damping_alpha = torch.tensor(
+                float(getattr(self.config, "damping_alpha", 1.0)),
+                device=x.device,
+                dtype=x.dtype,
+            )
 
         for r in range(T_rec):
             if r == 0:
@@ -344,6 +359,7 @@ class LLaDALoopedModel(LLaDAModel):
                     "T_rec": T_rec,
                     "use_damped_update": use_damped_update,
                     "damping_alpha": damping_alpha,
+                    "learn_damping_alpha": learn_damping_alpha,
                 }
                 if output_loop_diagnostics
                 else None
@@ -407,7 +423,7 @@ class LLaDALoopedModelLM(LLaDAModelLM):
             **loop_kwargs: forwarded to LLaDALoopedConfig
                 (prelude_layers, recurrent_layers, coda_layers,
                  use_latent_feedback, mu_rec_eval, use_damped_update,
-                 damping_alpha).
+                 damping_alpha, learn_damping_alpha).
         """
         from dllm.pipelines.llada.models.configuration_llada import LLaDAConfig
         from dllm.pipelines.llada.models.modeling_llada import LLaDAModelLM

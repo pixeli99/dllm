@@ -54,6 +54,7 @@ class LLaDALoopedConfig(LLaDAConfig):
         # The first pass is never damped, preserving T_rec=1 equivalence.
         use_damped_update: bool = False,
         damping_alpha: float = 0.5,
+        learn_damping_alpha: bool = False,
         **kwargs,
     ):
         kwargs.setdefault("architectures", ["LLaDALoopedModelLM"])
@@ -73,6 +74,7 @@ class LLaDALoopedConfig(LLaDAConfig):
         self.mu_rec_eval = int(mu_rec_eval)
         self.use_damped_update = bool(use_damped_update)
         self.damping_alpha = float(damping_alpha)
+        self.learn_damping_alpha = bool(learn_damping_alpha)
         if not 0.0 < self.damping_alpha <= 1.0:
             raise ValueError(
                 f"damping_alpha must be in (0, 1], got {self.damping_alpha}"

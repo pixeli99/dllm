@@ -16,7 +16,7 @@ cd "${repo_root}"
 accelerate launch \
   --config_file scripts/accelerate_configs/zero2.yaml \
   examples/llada_looped/sft.py \
-  --output_dir .models/loop_belief/openmath2-v2.1a-stage1-ins-damped-a0.5 \
+  --output_dir .models/loop_belief/openmath2-v2.1a-stage1-ins-damped-learnalpha-a0.5 \
   --dataset_args ".data/sft/llada/openmath2-500k" \
   --load_preprocessed_data True \
   --num_train_epochs 3 \
@@ -28,7 +28,7 @@ accelerate launch \
   --max_length 1024 \
   --learning_rate 5e-4 \
   --report_to tensorboard \
-  --logging_dir .models/loop_belief/openmath2-v2.1a-stage1-ins-damped-a0.5/tb \
+  --logging_dir .models/loop_belief/openmath2-v2.1a-stage1-ins-damped-learnalpha-a0.5/tb \
   --save_steps 0.25 \
   --save_total_limit 3 \
   --save_only_model False \
@@ -37,6 +37,7 @@ accelerate launch \
   --use_latent_feedback True \
   --use_damped_update True \
   --damping_alpha 0.5 \
+  --learn_damping_alpha True \
   --t_rec_min 2 --t_rec_max 4 --t_rec_eval 3 \
   --mu_rec_eval 3 \
   --loop_lr_mult 1.0 \

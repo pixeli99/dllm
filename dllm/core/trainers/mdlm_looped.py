@@ -8,7 +8,7 @@ Extends MDLMTrainer for the latent-feedback looped LLaDA:
 
   2. 1-step truncated BPTT inside the model.
 
-  3. Loop-param LR multiplier (recursive_link.*).
+  3. Loop-param LR multiplier (recursive_link.* plus optional damping alpha).
      10x is conservative; 50x is aggressive.
 
   4. Trainable-surface control. Default: freeze prelude + coda transformer
@@ -52,12 +52,13 @@ class MDLMLoopedConfig(MDLMConfig):
     t_rec_eval: int = 4
 
     # ---- LR multiplier for loop params ----
-    # Loop params: recursive_link.*.
+    # Loop params: recursive_link.* plus optional damping_alpha_logit.
     loop_lr_mult: float = 10.0
 
     # ---- Trainable-surface control ----
-    # The default profile (all True) trains ONLY recursive_link, freezing the
-    # entire vanilla-LLaDA backbone. This isolates the loop's contribution.
+    # The default profile (all True) trains ONLY recursive_link plus optional
+    # damping_alpha_logit, freezing the entire vanilla-LLaDA backbone. This
+    # isolates the loop's contribution.
     # For V1 (use_latent_feedback=False) this leaves nothing trainable -- pass
     # `--freeze_recurrent_blocks False --freeze_ln_f False --freeze_wte False`
     # to recover the V1 ablation surface (R blocks + ln_f + wte trainable).
@@ -74,7 +75,9 @@ class MDLMLoopedConfig(MDLMConfig):
 # Loop-param prefixes (after the HF base_model_prefix="model" wrapping).
 _LOOP_PARAM_PREFIXES = (
     "model.recursive_link.",
+    "model.damping_alpha_logit",
 )
+_LOOP_NO_DECAY_PARAM_NAMES = {"model.damping_alpha_logit"}
 
 
 def _is_loop_param_name(name: str) -> bool:
@@ -218,7 +221,10 @@ class MDLMLoopedTrainer(MDLMTrainer):
             if not p.requires_grad:
                 continue
             is_loop = _is_loop_param_name(name)
-            is_decay = name in decay_param_names
+            is_decay = (
+                name in decay_param_names
+                and name not in _LOOP_NO_DECAY_PARAM_NAMES
+            )
             if is_loop:
                 (loop_decay_params if is_decay else loop_no_decay_params).append(p)
             else:
@@ -365,11 +371,13 @@ class MDLMLoopedTrainer(MDLMTrainer):
                 except Exception:
                     pass
 
-        for key in ("use_damped_update", "damping_alpha"):
+        for key in ("use_damped_update", "damping_alpha", "learn_damping_alpha"):
             value = diag.get(key, None)
             if value is None:
                 continue
             try:
+                if torch.is_tensor(value):
+                    value = value.detach()
                 log_dict[f"loop/{key}"] = float(value)
             except Exception:
                 pass

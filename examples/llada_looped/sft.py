@@ -91,6 +91,7 @@ class LoopArguments:
     # ---- Optional feedback damping ----
     use_damped_update: bool = False
     damping_alpha: float = 0.5
+    learn_damping_alpha: bool = False
 
 
 @dataclass
@@ -173,6 +174,7 @@ def train():
             mu_rec_eval=loop_args.mu_rec_eval,
             use_damped_update=loop_args.use_damped_update,
             damping_alpha=loop_args.damping_alpha,
+            learn_damping_alpha=loop_args.learn_damping_alpha,
         )
         model = LLaDALoopedModelLM.from_llada_checkpoint(
             model_args.model_name_or_path, **loop_kwargs
