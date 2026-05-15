@@ -18,6 +18,7 @@ Extends MDLMTrainer for the latent-feedback looped LLaDA:
   5. Diagnostic logging to TensorBoard:
          loop/T_rec
          loop/residual_norm_iter{r}    -- ||h_r - h_{r-1}|| / ||h_{r-1}||
+         loop/raw_residual_norm_iter{r} -- undamped proposal movement, if enabled
          loop/adapter_update_norm_iter{r}
      Use these to diagnose fixed-point convergence and adapter activity.
 
@@ -354,7 +355,7 @@ class MDLMLoopedTrainer(MDLMTrainer):
 
         log_dict["loop/T_rec"] = float(T_rec)
 
-        for key in ("residual_norm", "adapter_update_norm"):
+        for key in ("residual_norm", "raw_residual_norm", "adapter_update_norm"):
             seq = diag.get(key, None)
             if not seq:
                 continue
@@ -363,6 +364,15 @@ class MDLMLoopedTrainer(MDLMTrainer):
                     log_dict[f"loop/{key}_iter{i}"] = float(v.item())
                 except Exception:
                     pass
+
+        for key in ("use_damped_update", "damping_alpha"):
+            value = diag.get(key, None)
+            if value is None:
+                continue
+            try:
+                log_dict[f"loop/{key}"] = float(value)
+            except Exception:
+                pass
 
         if log_dict:
             self.log(log_dict)

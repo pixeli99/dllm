@@ -5,6 +5,7 @@ Extends LLaDAConfig with:
   - prelude/recurrent/coda layer partition
   - latent-feedback toggle (loop variant V2) vs pure h-recurrence (V1)
   - RecursiveMAS-style latent Adapter
+  - optional damped recurrent state update for feedback iterations
 
 V1 with T_rec=1 is numerically equivalent to vanilla LLaDA. V2 intentionally
 passes the recurrent state through a trainable RecursiveLink before R, so it is
@@ -46,6 +47,13 @@ class LLaDALoopedConfig(LLaDAConfig):
         use_latent_feedback: bool = True,
         # ---- Eval-time T_rec default ----
         mu_rec_eval: int = 4,
+        # ---- Optional feedback damping ----
+        # When enabled, only feedback iterations (r >= 1) commit the proposed
+        # recurrent state through:
+        #   h_next = h_prev + damping_alpha * (R(link(h_prev)) - h_prev)
+        # The first pass is never damped, preserving T_rec=1 equivalence.
+        use_damped_update: bool = False,
+        damping_alpha: float = 0.5,
         **kwargs,
     ):
         kwargs.setdefault("architectures", ["LLaDALoopedModelLM"])
@@ -63,3 +71,9 @@ class LLaDALoopedConfig(LLaDAConfig):
         self.use_latent_feedback = bool(use_latent_feedback)
 
         self.mu_rec_eval = int(mu_rec_eval)
+        self.use_damped_update = bool(use_damped_update)
+        self.damping_alpha = float(damping_alpha)
+        if not 0.0 < self.damping_alpha <= 1.0:
+            raise ValueError(
+                f"damping_alpha must be in (0, 1], got {self.damping_alpha}"
+            )

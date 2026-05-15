@@ -19,7 +19,10 @@ KEY ARCHITECTURAL CHOICES (V2.1-a):
       h_0 = e = prelude(x)
       h_1 = R(h_0)                          # first pass: vanilla
       for r = 2, ..., T_rec:
-          h_r = R(RecursiveLink(h_{r-1}))   # feedback transition (no detach)
+          proposed = R(RecursiveLink(h_{r-1}))
+          h_r = proposed                     # default feedback transition
+          # optional:
+          # h_r = h_{r-1} + damping_alpha * (proposed - h_{r-1})
 
       RecursiveLink(h) = h + proj2(GELU(proj1(pre_ln(h))))
       proj2 is zero-initialized so the loop body starts as V1 dynamics
@@ -255,10 +258,13 @@ class LLaDALoopedModel(LLaDAModel):
         # LLaDA. The link is a feedback-transition bridge, not a modifier
         # of prelude output.
         diag_residual: List[torch.Tensor] = []
+        diag_raw_residual: List[torch.Tensor] = []
         diag_adapter_update: List[torch.Tensor] = []  # only logged for r >= 1
 
         h = e
         prev_h: Optional[torch.Tensor] = None
+        use_damped_update = bool(getattr(self.config, "use_damped_update", False))
+        damping_alpha = float(getattr(self.config, "damping_alpha", 1.0))
 
         for r in range(T_rec):
             if r == 0:
@@ -283,15 +289,25 @@ class LLaDALoopedModel(LLaDAModel):
                     h_out, attention_bias=eff_bias, layer_past=None, use_cache=False
                 )
 
+            h_next = h_out
+            if r > 0 and use_damped_update:
+                h_next = h + damping_alpha * (h_out - h)
+
             # Diagnostics (no_grad). Records ||h_r - h_{r-1}|| / ||h_{r-1}||
             # for r >= 1 (i.e., len = T_rec - 1).
             if output_loop_diagnostics and prev_h is not None:
                 with torch.no_grad():
-                    rel = (h_out - prev_h).norm() / prev_h.norm().clamp_min(1e-6)
+                    if use_damped_update:
+                        raw_rel = (
+                            (h_out - prev_h).norm()
+                            / prev_h.norm().clamp_min(1e-6)
+                        )
+                        diag_raw_residual.append(raw_rel)
+                    rel = (h_next - prev_h).norm() / prev_h.norm().clamp_min(1e-6)
                     diag_residual.append(rel)
-            prev_h = h_out
+            prev_h = h_next
 
-            h = h_out
+            h = h_next
 
         # ------------- Coda -------------
         x = h
@@ -323,8 +339,11 @@ class LLaDALoopedModel(LLaDAModel):
             "loop_diagnostics": (
                 {
                     "residual_norm": diag_residual,
+                    "raw_residual_norm": diag_raw_residual,
                     "adapter_update_norm": diag_adapter_update,
                     "T_rec": T_rec,
+                    "use_damped_update": use_damped_update,
+                    "damping_alpha": damping_alpha,
                 }
                 if output_loop_diagnostics
                 else None
@@ -387,7 +406,8 @@ class LLaDALoopedModelLM(LLaDAModelLM):
             torch_dtype: dtype for the materialized model (default bf16).
             **loop_kwargs: forwarded to LLaDALoopedConfig
                 (prelude_layers, recurrent_layers, coda_layers,
-                 use_latent_feedback, mu_rec_eval).
+                 use_latent_feedback, mu_rec_eval, use_damped_update,
+                 damping_alpha).
         """
         from dllm.pipelines.llada.models.configuration_llada import LLaDAConfig
         from dllm.pipelines.llada.models.modeling_llada import LLaDAModelLM

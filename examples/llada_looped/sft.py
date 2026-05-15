@@ -17,6 +17,8 @@ Two variants selectable at the command line:
       h_0 = e (prelude output)
       h_1 = R(h_0)                          # vanilla first pass
       h_r = R(RecursiveLink(h_{r-1}))       # feedback transition (r >= 2)
+      # Optional: --use_damped_update True commits feedback transitions via
+      # h_r = h_{r-1} + damping_alpha * (proposed_h_r - h_{r-1}).
 
       Default training T_rec ~ Uniform{2..6} (T=1 has no link gradient).
       Default trainable surface: ONLY recursive_link.* (~33M params).
@@ -86,6 +88,9 @@ class LoopArguments:
     use_latent_feedback: bool = True
     # ---- Eval-time T_rec written into config ----
     mu_rec_eval: int = 4
+    # ---- Optional feedback damping ----
+    use_damped_update: bool = False
+    damping_alpha: float = 0.5
 
 
 @dataclass
@@ -166,6 +171,8 @@ def train():
             coda_layers=loop_args.coda_layers,
             use_latent_feedback=loop_args.use_latent_feedback,
             mu_rec_eval=loop_args.mu_rec_eval,
+            use_damped_update=loop_args.use_damped_update,
+            damping_alpha=loop_args.damping_alpha,
         )
         model = LLaDALoopedModelLM.from_llada_checkpoint(
             model_args.model_name_or_path, **loop_kwargs
