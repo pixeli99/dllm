@@ -42,6 +42,7 @@ accelerate launch \
   --use_damped_update True \
   --damping_schedule normalized \
   --damping_tau "${tau}" \
+  --learn_damping_tau True \
   --t_rec_min 2 --t_rec_max 4 --t_rec_eval 3 \
   --mu_rec_eval 3 \
   --loop_lr_mult 1.0 \

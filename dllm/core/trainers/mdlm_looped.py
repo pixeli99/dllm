@@ -8,7 +8,8 @@ Extends MDLMTrainer for the latent-feedback looped LLaDA:
 
   2. 1-step truncated BPTT inside the model.
 
-  3. Loop-param LR multiplier (recursive_link.* plus optional damping alpha).
+  3. Loop-param LR multiplier (recursive_link.*, workspace_slots, plus
+     optional damping alpha/tau logits).
      10x is conservative; 50x is aggressive.
 
   4. Trainable-surface control. Default: freeze prelude + coda transformer
@@ -53,7 +54,8 @@ class MDLMLoopedConfig(MDLMConfig):
     t_rec_eval: int = 4
 
     # ---- LR multiplier for loop params ----
-    # Loop params: recursive_link.* plus optional damping_alpha_logit.
+    # Loop params: recursive_link.* plus optional damping alpha/tau logits
+    # plus workspace_slots.
     loop_lr_mult: float = 10.0
 
     # ---- Trainable-surface control ----
@@ -69,6 +71,15 @@ class MDLMLoopedConfig(MDLMConfig):
     freeze_ln_f: bool = True
     freeze_wte: bool = True
 
+    # ---- Deep supervision (v2) ----
+    # When enabled, run intermediate loop-iteration hidden states through the
+    # frozen coda + ln_f + tied lm_head, then add a weighted CE term on masked
+    # positions. K iterations are randomly sampled per step from
+    # {0, ..., T_rec - 2}; T_rec=1 contributes 0.
+    enable_deep_sup: bool = False
+    deep_sup_k_subset: int = 2
+    lambda_deep: float = 0.3
+
     # ---- Diagnostics ----
     diag_log_every: int = 50
 
@@ -77,8 +88,14 @@ class MDLMLoopedConfig(MDLMConfig):
 _LOOP_PARAM_PREFIXES = (
     "model.recursive_link.",
     "model.damping_alpha_logit",
+    "model.damping_tau_logit",
+    "model.workspace_slots",
 )
-_LOOP_NO_DECAY_PARAM_NAMES = {"model.damping_alpha_logit"}
+_LOOP_NO_DECAY_PARAM_NAMES = {
+    "model.damping_alpha_logit",
+    "model.damping_tau_logit",
+    "model.workspace_slots",
+}
 
 
 def _is_loop_param_name(name: str) -> bool:
@@ -108,6 +125,10 @@ class MDLMLoopedTrainer(MDLMTrainer):
         self.freeze_coda = bool(args.freeze_coda)
         self.freeze_ln_f = bool(args.freeze_ln_f)
         self.freeze_wte = bool(args.freeze_wte)
+
+        self.enable_deep_sup = bool(getattr(args, "enable_deep_sup", False))
+        self.deep_sup_k_subset = max(1, int(getattr(args, "deep_sup_k_subset", 2)))
+        self.lambda_deep = float(getattr(args, "lambda_deep", 0.3))
 
         self._apply_block_freeze()
 
@@ -300,11 +321,19 @@ class MDLMLoopedTrainer(MDLMTrainer):
             getattr(self.state, "global_step", 0) % self.diag_log_every == 0
         ) and model.training
 
+        want_loop_hiddens = (
+            self.enable_deep_sup
+            and self.lambda_deep > 0.0
+            and model.training
+            and T_rec > 1
+        )
+
         outputs = model(
             input_ids=noised_input_ids,
             attention_mask=attention_mask,
             T_rec=T_rec,
             output_loop_diagnostics=want_diag,
+            return_loop_hiddens=want_loop_hiddens,
         )
         outputs = self._postprocess_outputs(outputs)
         logits = outputs.logits
@@ -346,12 +375,144 @@ class MDLMLoopedTrainer(MDLMTrainer):
 
         loss = token_nll.sum()
 
+        # 6b. Deep supervision (v2): coda-aware readout on masked positions.
+        # No-op when disabled, when T_rec=1, or when no masked positions exist.
+        if want_loop_hiddens and getattr(outputs, "loop_hiddens", None) is not None:
+            deep_loss = self._compute_deep_supervision_loss(
+                model=model,
+                loop_hiddens=outputs.loop_hiddens,
+                target_ids=input_ids,
+                masked_mask=masked_mask,
+                loss_weights=loss_weights,
+                attention_mask=attention_mask,
+            )
+            loss = loss + self.lambda_deep * deep_loss
+            if want_diag:
+                try:
+                    self.log({"loop/deep_sup_loss": float(deep_loss.detach().item())})
+                except Exception:
+                    pass
+
         # 7. Diagnostic logging
         if want_diag and outputs.loop_diagnostics is not None:
             diag = dict(outputs.loop_diagnostics)
             self._log_loop_diagnostics(diag, T_rec=T_rec)
 
         return (loss, outputs) if return_outputs else loss
+
+    # ------------------------------------------------------------------
+    # Deep supervision helper (v2)
+    # ------------------------------------------------------------------
+
+    def _find_looped_inner(self, model):
+        """Walk through DDP/HF wrappers until we reach LLaDALoopedModel."""
+        inner = model
+        # Bounded walk to avoid pathological loops.
+        for _ in range(8):
+            if hasattr(inner, "transformer") and hasattr(inner, "config"):
+                return inner
+            if hasattr(inner, "module"):
+                inner = inner.module
+            elif hasattr(inner, "model"):
+                inner = inner.model
+            else:
+                break
+        raise RuntimeError(
+            "Could not locate LLaDALoopedModel in wrapper chain "
+            f"starting at {type(model).__name__}; "
+            "deep supervision needs access to .transformer.ln_f and .transformer.wte."
+        )
+
+    def _compute_deep_supervision_loss(
+        self,
+        model,
+        loop_hiddens: List[torch.Tensor],
+        target_ids: torch.Tensor,
+        masked_mask: torch.Tensor,
+        loss_weights: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Project intermediate loop hiddens through coda + LM readout.
+
+        Memory: we gather masked positions BEFORE projecting to vocab so the
+        per-iteration tensor is [N_masked, V] rather than [B, L, V]. With
+        N_masked << B*L this avoids OOM on T_rec=6 BPTT.
+        """
+        inner = self._find_looped_inner(model)
+        cfg = inner.config
+        ln_f = inner.transformer.ln_f
+        wte = inner.transformer.wte
+        use_weight_tying = bool(getattr(cfg, "weight_tying", True))
+        scale_logits = bool(getattr(cfg, "scale_logits", False))
+        d_model = int(cfg.d_model)
+        prelude_end = int(getattr(cfg, "prelude_layers", 0))
+        coda_start = prelude_end + int(getattr(cfg, "recurrent_layers", 0))
+        coda_blocks = inner.transformer.blocks[coda_start:]
+
+        n_iter = len(loop_hiddens)
+        # Final iteration's hidden flows through coda + main CE; supervise
+        # only iterations 0..n_iter-2.
+        n_inter = max(0, n_iter - 1)
+        if n_inter == 0:
+            return torch.zeros((), device=target_ids.device, dtype=loop_hiddens[0].dtype)
+
+        masked_flat = masked_mask.bool()
+        n_masked = int(masked_flat.sum().item())
+        if n_masked == 0:
+            return torch.zeros((), device=target_ids.device, dtype=loop_hiddens[0].dtype)
+
+        k = min(self.deep_sup_k_subset, n_inter)
+        perm = torch.randperm(n_inter, device=target_ids.device)
+        indices = perm[:k].tolist()
+
+        targets_flat = target_ids[masked_flat]  # [N]
+        weights_flat = loss_weights[masked_flat]  # [N]
+        norm = masked_mask.sum().clamp_min(1).to(dtype=loop_hiddens[0].dtype)
+        batch = target_ids.shape[0]
+        seq_len = target_ids.shape[1]
+
+        coda_bias = None
+        if attention_mask is not None and 0.0 in attention_mask:
+            coda_bias = inner.get_bidirectional_attention_bias(
+                seq_len, target_ids.device
+            ).to(dtype=torch.float)
+            coda_am = attention_mask.to(dtype=torch.float).view(
+                batch, -1
+            )[:, None, None, :]
+            coda_am = (1.0 - coda_am) * torch.finfo(coda_am.dtype).min
+            coda_bias = coda_bias[:, :, :seq_len, :seq_len] + coda_am
+
+        deep_total = torch.zeros((), device=target_ids.device, dtype=loop_hiddens[0].dtype)
+        for r in indices:
+            h_r = loop_hiddens[r]  # [B, L, d]
+            for block in coda_blocks:
+                h_r, _ = block(
+                    h_r,
+                    attention_bias=coda_bias,
+                    layer_past=None,
+                    use_cache=False,
+                )
+            h_r = ln_f(h_r)
+            h_r_masked = h_r[masked_flat]  # [N, d]
+            if use_weight_tying:
+                logits_r = F.linear(h_r_masked, wte.weight, None)
+            else:
+                logits_r = inner.transformer.ff_out(h_r_masked)
+            if scale_logits:
+                logits_r = logits_r * (1.0 / (d_model ** 0.5))
+
+            ce_r = F.cross_entropy(logits_r, targets_flat, reduction="none")
+            ce_r = ce_r * weights_flat.to(dtype=ce_r.dtype)
+
+            if self.loss_norm_type == "batch":
+                ce_r_sum = ce_r.sum() / batch
+            else:
+                # "token" (default) and "sequence" approximated as token-norm.
+                ce_r_sum = ce_r.sum() / norm
+
+            deep_total = deep_total + ce_r_sum
+
+        return deep_total / float(len(indices))
 
     # ------------------------------------------------------------------
     # Diagnostic logging
@@ -367,6 +528,8 @@ class MDLMLoopedTrainer(MDLMTrainer):
             "raw_residual_norm",
             "adapter_update_norm",
             "damping_alpha",
+            "workspace_norm",
+            "workspace_update_norm",
         ):
             seq = diag.get(key, None)
             if not seq:
@@ -383,6 +546,7 @@ class MDLMLoopedTrainer(MDLMTrainer):
             "damping_tau",
             "damping_decay_beta",
             "learn_damping_alpha",
+            "learn_damping_tau",
         ):
             value = diag.get(key, None)
             if value is None:

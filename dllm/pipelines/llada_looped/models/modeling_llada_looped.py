@@ -80,6 +80,11 @@ class LoopedLLaDAOutput(CausalLMOutputWithPast):
     """Adds loop diagnostics on top of HF's CausalLMOutputWithPast."""
 
     loop_diagnostics: Optional[Dict[str, Any]] = None
+    # Per-iteration token hidden states after the recurrent loop (length T_rec).
+    # Each tensor is [B, L, d_model]; feedback workspace slots are not returned.
+    # Only populated when return_loop_hiddens=True is passed to forward.
+    # Consumed by deep-supervision auxiliary loss in MDLMLoopedTrainer.
+    loop_hiddens: Optional[List[torch.Tensor]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +181,43 @@ class LLaDALoopedModel(LLaDAModel):
             self.damping_alpha_logit = nn.Parameter(
                 torch.tensor(logit, device=dev)
             )
+        if (
+            config.use_damped_update
+            and config.damping_schedule in {"normalized", "decay"}
+            and getattr(config, "learn_damping_tau", True)
+        ):
+            tau = max(float(config.damping_tau), 1e-6)
+            self.damping_tau_logit = nn.Parameter(
+                torch.tensor(math.log(math.expm1(tau)), device=dev)
+            )
+
+        # Feedback-only workspace slots. They are appended to R inputs only for
+        # feedback iterations (r >= 1), never to prelude/coda or the first pass.
+        # Always init even when init_params=False: these parameters are absent
+        # from vanilla checkpoints.
+        workspace_size = int(getattr(config, "workspace_size", 0))
+        if workspace_size > 0:
+            self.workspace_slots = nn.Parameter(
+                torch.empty(workspace_size, d, device=dev)
+            )
+            nn.init.normal_(
+                self.workspace_slots,
+                std=float(getattr(config, "workspace_init_std", 0.02)),
+            )
+
+    def _damping_tau(self, ref: torch.Tensor) -> torch.Tensor:
+        """Return the total feedback refinement budget."""
+        dtype = ref.dtype
+        device = ref.device
+        if bool(getattr(self.config, "learn_damping_tau", True)) and hasattr(
+            self, "damping_tau_logit"
+        ):
+            return F.softplus(self.damping_tau_logit).to(device=device, dtype=dtype)
+        return torch.tensor(
+            float(getattr(self.config, "damping_tau", 1.0)),
+            device=device,
+            dtype=dtype,
+        )
 
     def _feedback_alpha(self, r: int, T_rec: int, ref: torch.Tensor) -> torch.Tensor:
         """Return the damping step size for feedback iteration r."""
@@ -197,11 +239,7 @@ class LLaDALoopedModel(LLaDAModel):
                 )
         else:
             feedback_steps = max(int(T_rec) - 1, 1)
-            tau = torch.tensor(
-                float(getattr(self.config, "damping_tau", 1.0)),
-                device=device,
-                dtype=dtype,
-            )
+            tau = self._damping_tau(ref)
             if schedule == "normalized":
                 alpha = tau / float(feedback_steps)
             elif schedule == "decay":
@@ -230,6 +268,7 @@ class LLaDALoopedModel(LLaDAModel):
         output_hidden_states: Optional[bool] = None,
         T_rec: Optional[int] = None,
         output_loop_diagnostics: bool = False,
+        return_loop_hiddens: bool = False,
     ) -> Tuple[LLaDAOutput, Dict[str, Any]]:
         assert not self.config.alibi, "ALiBi not supported for MDM."
         assert self.config.rope, "RoPE required for MDM."
@@ -252,10 +291,16 @@ class LLaDALoopedModel(LLaDAModel):
         else:
             B_, T_ = input_ids.size()
             x = self.transformer.wte(input_ids)
+        token_len = T_
+        token_attention_mask = attention_mask
 
         if self.config.input_emb_norm:
             x = x * (self.config.d_model ** 0.5)
         x = self.transformer.emb_drop(x)
+
+        # Workspace is feedback-only. Keep the token path untouched here so
+        # T_rec=1 remains exactly the vanilla split computation.
+        m = int(getattr(self.config, "workspace_size", 0))
 
         if attention_mask is not None and 0.0 in attention_mask:
             am = attention_mask.to(dtype=torch.float).view(B_, -1)[:, None, None, :]
@@ -277,6 +322,61 @@ class LLaDALoopedModel(LLaDAModel):
             if am is not None:
                 eff_bias = eff_bias + am
                 ensure_finite_(eff_bias, check_neg_inf=True, check_pos_inf=False)
+
+        feedback_eff_bias: Optional[torch.Tensor] = None
+        use_workspace = m > 0 and T_rec > 1
+        if use_workspace:
+            feedback_len = token_len + m
+            assert feedback_len <= self.config.max_sequence_length, (
+                f"seq_len + workspace_size ({token_len} + {m}) exceeds "
+                f"max_sequence_length ({self.config.max_sequence_length}); "
+                f"RoPE cache will not cover feedback workspace positions."
+            )
+            if attention_bias is not None:
+                base_bias = attention_bias
+                if base_bias.dtype in (torch.int8, torch.bool):
+                    base_bias = base_bias.to(dtype=torch.float)
+                    base_bias.masked_fill_(
+                        base_bias == 0.0, torch.finfo(base_bias.dtype).min
+                    )
+                base_bias = base_bias[:, :, :token_len, :token_len].to(
+                    dtype=torch.float
+                )
+                feedback_eff_bias = base_bias.new_zeros(
+                    base_bias.shape[:-2] + (feedback_len, feedback_len)
+                )
+                feedback_eff_bias[..., :token_len, :token_len] = base_bias
+            elif token_attention_mask is not None and 0.0 in token_attention_mask:
+                feedback_eff_bias = self.get_bidirectional_attention_bias(
+                    feedback_len, x.device
+                ).to(dtype=torch.float)
+
+            if token_attention_mask is not None and 0.0 in token_attention_mask:
+                workspace_mask = torch.ones(
+                    B_,
+                    m,
+                    device=token_attention_mask.device,
+                    dtype=token_attention_mask.dtype,
+                )
+                feedback_mask = torch.cat(
+                    [token_attention_mask, workspace_mask], dim=1
+                )
+                feedback_am = feedback_mask.to(dtype=torch.float).view(
+                    B_, -1
+                )[:, None, None, :]
+                feedback_am = (1.0 - feedback_am) * torch.finfo(
+                    feedback_am.dtype
+                ).min
+                if feedback_eff_bias is None:
+                    feedback_eff_bias = self.get_bidirectional_attention_bias(
+                        feedback_len, x.device
+                    ).to(dtype=torch.float)
+                feedback_eff_bias = feedback_eff_bias + feedback_am
+                ensure_finite_(
+                    feedback_eff_bias,
+                    check_neg_inf=True,
+                    check_pos_inf=False,
+                )
 
         prelude_end = int(self.config.prelude_layers)
         coda_start = prelude_end + int(self.config.recurrent_layers)
@@ -310,12 +410,31 @@ class LLaDALoopedModel(LLaDAModel):
         diag_raw_residual: List[torch.Tensor] = []
         diag_adapter_update: List[torch.Tensor] = []  # only logged for r >= 1
         diag_damping_alpha: List[torch.Tensor] = []  # only logged for r >= 1
+        diag_workspace_norm: List[torch.Tensor] = []  # only logged for r >= 1
+        diag_workspace_update: List[torch.Tensor] = []  # only logged for r >= 1
+        loop_hiddens: List[torch.Tensor] = []  # for deep supervision (no detach)
 
         h = e
         prev_h: Optional[torch.Tensor] = None
         use_damped_update = bool(getattr(self.config, "use_damped_update", False))
         learn_damping_alpha = bool(getattr(self.config, "learn_damping_alpha", False))
+        learn_damping_tau = bool(getattr(self.config, "learn_damping_tau", True))
         damping_schedule = str(getattr(self.config, "damping_schedule", "constant"))
+        workspace: Optional[torch.Tensor] = None
+        if use_workspace:
+            workspace_slots = self.workspace_slots.unsqueeze(0).expand(
+                B_, -1, -1
+            ).to(device=h.device, dtype=h.dtype)
+            if token_attention_mask is not None:
+                weights = token_attention_mask.to(
+                    device=h.device, dtype=h.dtype
+                ).view(B_, token_len, 1)
+                summary = (h * weights).sum(dim=1) / weights.sum(
+                    dim=1
+                ).clamp_min(1.0)
+            else:
+                summary = h.mean(dim=1)
+            workspace = workspace_slots + summary.unsqueeze(1)
 
         for r in range(T_rec):
             if r == 0:
@@ -334,18 +453,38 @@ class LLaDALoopedModel(LLaDAModel):
                     h_input = h
 
             # Run R blocks (16 layers, weight-shared across iters).
-            h_out = h_input
+            with_workspace = r > 0 and workspace is not None
+            h_out = (
+                torch.cat([h_input, workspace], dim=1)
+                if with_workspace
+                else h_input
+            )
+            recurrent_bias = feedback_eff_bias if with_workspace else eff_bias
             for block in blocks[prelude_end:coda_start]:
                 h_out, _ = block(
-                    h_out, attention_bias=eff_bias, layer_past=None, use_cache=False
+                    h_out,
+                    attention_bias=recurrent_bias,
+                    layer_past=None,
+                    use_cache=False,
                 )
 
+            workspace_out: Optional[torch.Tensor] = None
+            if with_workspace:
+                h_out, workspace_out = h_out[:, :token_len, :], h_out[:, token_len:, :]
+
             h_next = h_out
+            workspace_next = workspace
             if r > 0 and use_damped_update:
                 damping_alpha = self._feedback_alpha(r=r, T_rec=T_rec, ref=h)
                 h_next = h + damping_alpha * (h_out - h)
+                if workspace is not None and workspace_out is not None:
+                    workspace_next = workspace + damping_alpha * (
+                        workspace_out - workspace
+                    )
                 if output_loop_diagnostics:
                     diag_damping_alpha.append(damping_alpha.detach())
+            elif workspace_out is not None:
+                workspace_next = workspace_out
 
             # Diagnostics (no_grad). Records ||h_r - h_{r-1}|| / ||h_{r-1}||
             # for r >= 1 (i.e., len = T_rec - 1).
@@ -359,9 +498,24 @@ class LLaDALoopedModel(LLaDAModel):
                         diag_raw_residual.append(raw_rel)
                     rel = (h_next - prev_h).norm() / prev_h.norm().clamp_min(1e-6)
                     diag_residual.append(rel)
+                    if with_workspace and workspace is not None and workspace_next is not None:
+                        diag_workspace_norm.append(
+                            workspace_next.norm() / h_next.norm().clamp_min(1e-6)
+                        )
+                        diag_workspace_update.append(
+                            (workspace_next - workspace).norm()
+                            / workspace.norm().clamp_min(1e-6)
+                        )
             prev_h = h_next
 
             h = h_next
+            workspace = workspace_next
+
+            # Stash post-iteration hidden for deep supervision. No detach
+            # (BPTT already retains these for backward); appending a Python
+            # reference is free.
+            if return_loop_hiddens:
+                loop_hiddens.append(h)
 
         # ------------- Coda -------------
         x = h
@@ -396,6 +550,8 @@ class LLaDALoopedModel(LLaDAModel):
                     "raw_residual_norm": diag_raw_residual,
                     "adapter_update_norm": diag_adapter_update,
                     "damping_alpha": diag_damping_alpha,
+                    "workspace_norm": diag_workspace_norm,
+                    "workspace_update_norm": diag_workspace_update,
                     "T_rec": T_rec,
                     "use_damped_update": use_damped_update,
                     "damping_schedule_id": {
@@ -403,15 +559,24 @@ class LLaDALoopedModel(LLaDAModel):
                         "normalized": 1.0,
                         "decay": 2.0,
                     }.get(damping_schedule, -1.0),
-                    "damping_tau": float(getattr(self.config, "damping_tau", 1.0)),
+                    "damping_tau": (
+                        self._damping_tau(h).detach()
+                        if (
+                            use_damped_update
+                            and damping_schedule in {"normalized", "decay"}
+                        )
+                        else float(getattr(self.config, "damping_tau", 1.0))
+                    ),
                     "damping_decay_beta": float(
                         getattr(self.config, "damping_decay_beta", 0.0)
                     ),
                     "learn_damping_alpha": learn_damping_alpha,
+                    "learn_damping_tau": learn_damping_tau,
                 }
                 if output_loop_diagnostics
                 else None
             ),
+            "loop_hiddens": loop_hiddens if return_loop_hiddens else None,
         }
         return out, loop_extras
 
@@ -472,7 +637,8 @@ class LLaDALoopedModelLM(LLaDAModelLM):
                 (prelude_layers, recurrent_layers, coda_layers,
                  use_latent_feedback, mu_rec_eval, use_damped_update,
                  damping_schedule, damping_alpha, learn_damping_alpha,
-                 damping_tau, damping_decay_beta).
+                 damping_tau, learn_damping_tau, damping_decay_beta, workspace_size,
+                 workspace_init_std).
         """
         from dllm.pipelines.llada.models.configuration_llada import LLaDAConfig
         from dllm.pipelines.llada.models.modeling_llada import LLaDAModelLM
@@ -527,6 +693,7 @@ class LLaDALoopedModelLM(LLaDAModelLM):
         cache_position: Optional[torch.LongTensor] = None,
         T_rec: Optional[int] = None,
         output_loop_diagnostics: bool = False,
+        return_loop_hiddens: bool = False,
     ) -> Union[Tuple, LoopedLLaDAOutput]:
         if use_cache is None:
             use_cache = self.config.use_cache
@@ -546,6 +713,7 @@ class LLaDALoopedModelLM(LLaDAModelLM):
             output_hidden_states=output_hidden_states,
             T_rec=T_rec,
             output_loop_diagnostics=output_loop_diagnostics,
+            return_loop_hiddens=return_loop_hiddens,
         )
 
         logits = outputs.logits
@@ -568,6 +736,7 @@ class LLaDALoopedModelLM(LLaDAModelLM):
             past_key_values=outputs.attn_key_values,
             hidden_states=hidden_states,
             loop_diagnostics=loop_extras["loop_diagnostics"],
+            loop_hiddens=loop_extras.get("loop_hiddens"),
         )
 
     def can_generate(self) -> bool:

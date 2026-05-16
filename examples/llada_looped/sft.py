@@ -95,7 +95,13 @@ class LoopArguments:
     damping_alpha: float = 0.5
     learn_damping_alpha: bool = False
     damping_tau: float = 1.0
+    learn_damping_tau: bool = True
     damping_decay_beta: float = 0.0
+    # ---- Feedback-only workspace slots ----
+    # workspace_size=0 is the baseline. When >0, slots are appended only inside
+    # feedback recurrent passes (r >= 1), so T_rec=1 keeps the vanilla path.
+    workspace_size: int = 0
+    workspace_init_std: float = 0.02
 
 
 @dataclass
@@ -181,7 +187,10 @@ def train():
             damping_alpha=loop_args.damping_alpha,
             learn_damping_alpha=loop_args.learn_damping_alpha,
             damping_tau=loop_args.damping_tau,
+            learn_damping_tau=loop_args.learn_damping_tau,
             damping_decay_beta=loop_args.damping_decay_beta,
+            workspace_size=loop_args.workspace_size,
+            workspace_init_std=loop_args.workspace_init_std,
         )
         model = LLaDALoopedModelLM.from_llada_checkpoint(
             model_args.model_name_or_path, **loop_kwargs

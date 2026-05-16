@@ -45,6 +45,7 @@ accelerate launch \
   --use_damped_update True \
   --damping_schedule decay \
   --damping_tau "${tau}" \
+  --learn_damping_tau True \
   --damping_decay_beta "${beta}" \
   --t_rec_min 2 --t_rec_max 4 --t_rec_eval 3 \
   --mu_rec_eval 3 \

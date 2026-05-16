@@ -54,13 +54,23 @@ class LLaDALoopedConfig(LLaDAConfig):
         #   constant:   alpha = damping_alpha
         #   normalized: alpha = damping_tau / (T_rec - 1)
         #   decay:      sum_r alpha_r = damping_tau with exponential decay
+        # learn_damping_tau makes damping_tau a learnable positive total budget
+        # for normalized/decay schedules.
         # The first pass is never damped, preserving T_rec=1 equivalence.
         use_damped_update: bool = False,
         damping_schedule: str = "constant",
         damping_alpha: float = 0.5,
         learn_damping_alpha: bool = False,
         damping_tau: float = 1.0,
+        learn_damping_tau: bool = True,
         damping_decay_beta: float = 0.0,
+        # ---- Feedback-only workspace slots ----
+        # When workspace_size > 0, learnable continuous slots are appended only
+        # during feedback recurrent passes (r >= 1). Prelude, first R pass, coda,
+        # and LM head remain token-only. Therefore T_rec=1 is still exactly the
+        # vanilla split path even when workspace_size > 0.
+        workspace_size: int = 0,
+        workspace_init_std: float = 0.02,
         **kwargs,
     ):
         kwargs.setdefault("architectures", ["LLaDALoopedModelLM"])
@@ -83,6 +93,7 @@ class LLaDALoopedConfig(LLaDAConfig):
         self.damping_alpha = float(damping_alpha)
         self.learn_damping_alpha = bool(learn_damping_alpha)
         self.damping_tau = float(damping_tau)
+        self.learn_damping_tau = bool(learn_damping_tau)
         self.damping_decay_beta = float(damping_decay_beta)
         valid_schedules = {"constant", "normalized", "decay"}
         if self.damping_schedule not in valid_schedules:
@@ -103,4 +114,15 @@ class LLaDALoopedConfig(LLaDAConfig):
         if self.learn_damping_alpha and self.damping_schedule != "constant":
             raise ValueError(
                 "learn_damping_alpha is only supported for constant damping_schedule"
+            )
+
+        self.workspace_size = int(workspace_size)
+        self.workspace_init_std = float(workspace_init_std)
+        if self.workspace_size < 0:
+            raise ValueError(
+                f"workspace_size must be >= 0, got {self.workspace_size}"
+            )
+        if self.workspace_init_std <= 0.0:
+            raise ValueError(
+                f"workspace_init_std must be > 0, got {self.workspace_init_std}"
             )
