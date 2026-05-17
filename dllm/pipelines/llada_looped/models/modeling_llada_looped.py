@@ -23,7 +23,8 @@ KEY ARCHITECTURAL CHOICES (V2.1-a):
           h_r = proposed                     # default feedback transition
           # optional:
           # h_r = h_{r-1} + alpha_r * (proposed - h_{r-1})
-          # where alpha_r can be constant, normalized by T_rec, or decayed.
+          # where alpha_r can be constant, normalized by T_rec, decayed,
+          # or conditioned on the current diffusion mask state.
 
       RecursiveLink(h) = h + proj2(GELU(proj1(pre_ln(h))))
       proj2 is zero-initialized so the loop body starts as V1 dynamics
@@ -190,6 +191,14 @@ class LLaDALoopedModel(LLaDAModel):
             self.damping_tau_logit = nn.Parameter(
                 torch.tensor(math.log(math.expm1(tau)), device=dev)
             )
+        if (
+            config.use_damped_update
+            and getattr(config, "use_diffusion_conditioned_damping", False)
+            and getattr(config, "learn_mask_tau", True)
+        ):
+            self.mask_tau_slope = nn.Parameter(
+                torch.tensor(float(config.mask_tau_slope_init), device=dev)
+            )
 
         # Feedback-only workspace slots. They are appended to R inputs only for
         # feedback iterations (r >= 1), never to prelude/coda or the first pass.
@@ -205,21 +214,65 @@ class LLaDALoopedModel(LLaDAModel):
                 std=float(getattr(config, "workspace_init_std", 0.02)),
             )
 
-    def _damping_tau(self, ref: torch.Tensor) -> torch.Tensor:
-        """Return the total feedback refinement budget."""
+    def _base_damping_tau_logit(self, ref: torch.Tensor) -> torch.Tensor:
+        """Return the unconstrained base tau parameter on ref's device/dtype."""
         dtype = ref.dtype
         device = ref.device
         if bool(getattr(self.config, "learn_damping_tau", True)) and hasattr(
             self, "damping_tau_logit"
         ):
-            return F.softplus(self.damping_tau_logit).to(device=device, dtype=dtype)
+            return self.damping_tau_logit.to(device=device, dtype=dtype)
+        tau = max(float(getattr(self.config, "damping_tau", 1.0)), 1e-6)
         return torch.tensor(
-            float(getattr(self.config, "damping_tau", 1.0)),
+            math.log(math.expm1(tau)),
             device=device,
             dtype=dtype,
         )
 
-    def _feedback_alpha(self, r: int, T_rec: int, ref: torch.Tensor) -> torch.Tensor:
+    def _damping_tau(
+        self,
+        ref: torch.Tensor,
+        mask_ratio: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return the total feedback refinement budget.
+
+        When diffusion-conditioned damping is enabled, tau becomes a per-sample
+        budget:
+
+            tau_b = softplus(tau_logit + slope * (mask_ratio_b - ref_ratio))
+
+        This is initialized to the ordinary global tau when slope=0.
+        """
+        tau_logit = self._base_damping_tau_logit(ref)
+        if (
+            bool(getattr(self.config, "use_diffusion_conditioned_damping", False))
+            and mask_ratio is not None
+            and str(getattr(self.config, "damping_schedule", "constant")).lower()
+            in {"normalized", "decay"}
+        ):
+            slope = (
+                self.mask_tau_slope
+                if hasattr(self, "mask_tau_slope")
+                else torch.tensor(
+                    float(getattr(self.config, "mask_tau_slope_init", 0.0)),
+                    device=ref.device,
+                    dtype=ref.dtype,
+                )
+            )
+            slope = slope.to(device=ref.device, dtype=ref.dtype)
+            centered_ratio = mask_ratio.to(device=ref.device, dtype=ref.dtype) - float(
+                getattr(self.config, "mask_tau_ref", 0.5)
+            )
+            tau_logit = tau_logit + slope * centered_ratio
+        return F.softplus(tau_logit).to(device=ref.device, dtype=ref.dtype)
+
+    def _feedback_alpha(
+        self,
+        r: int,
+        T_rec: int,
+        ref: torch.Tensor,
+        mask_ratio: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Return the damping step size for feedback iteration r."""
         schedule = str(getattr(self.config, "damping_schedule", "constant")).lower()
         dtype = ref.dtype
@@ -239,7 +292,7 @@ class LLaDALoopedModel(LLaDAModel):
                 )
         else:
             feedback_steps = max(int(T_rec) - 1, 1)
-            tau = self._damping_tau(ref)
+            tau = self._damping_tau(ref, mask_ratio=mask_ratio)
             if schedule == "normalized":
                 alpha = tau / float(feedback_steps)
             elif schedule == "decay":
@@ -301,6 +354,40 @@ class LLaDALoopedModel(LLaDAModel):
         # Workspace is feedback-only. Keep the token path untouched here so
         # T_rec=1 remains exactly the vanilla split computation.
         m = int(getattr(self.config, "workspace_size", 0))
+
+        diffusion_conditioned_damping = bool(
+            getattr(self.config, "use_diffusion_conditioned_damping", False)
+        )
+        diffusion_mask_ratio: Optional[torch.Tensor] = None
+        diffusion_token_gate: Optional[torch.Tensor] = None
+        if (
+            diffusion_conditioned_damping
+            and input_ids is not None
+            and getattr(self.config, "mask_token_id", None) is not None
+        ):
+            mask_token_id = int(getattr(self.config, "mask_token_id"))
+            valid_tokens = (
+                attention_mask.to(device=input_ids.device, dtype=torch.bool)
+                if attention_mask is not None
+                else torch.ones_like(input_ids, dtype=torch.bool)
+            )
+            mask_tokens = (input_ids == mask_token_id) & valid_tokens
+            valid_counts = valid_tokens.sum(dim=1).clamp_min(1)
+            diffusion_mask_ratio = mask_tokens.to(dtype=x.dtype).sum(dim=1) / (
+                valid_counts.to(dtype=x.dtype)
+            )
+            masked_gate = float(getattr(self.config, "damping_masked_gate", 1.0))
+            unmasked_gate = float(getattr(self.config, "damping_unmasked_gate", 0.1))
+            diffusion_token_gate = torch.where(
+                mask_tokens.unsqueeze(-1),
+                torch.full_like(x[..., :1], masked_gate),
+                torch.full_like(x[..., :1], unmasked_gate),
+            )
+            diffusion_token_gate = torch.where(
+                valid_tokens.unsqueeze(-1),
+                diffusion_token_gate,
+                torch.zeros_like(diffusion_token_gate),
+            )
 
         if attention_mask is not None and 0.0 in attention_mask:
             am = attention_mask.to(dtype=torch.float).view(B_, -1)[:, None, None, :]
@@ -410,6 +497,7 @@ class LLaDALoopedModel(LLaDAModel):
         diag_raw_residual: List[torch.Tensor] = []
         diag_adapter_update: List[torch.Tensor] = []  # only logged for r >= 1
         diag_damping_alpha: List[torch.Tensor] = []  # only logged for r >= 1
+        diag_damping_alpha_effective: List[torch.Tensor] = []
         diag_workspace_norm: List[torch.Tensor] = []  # only logged for r >= 1
         diag_workspace_update: List[torch.Tensor] = []  # only logged for r >= 1
         loop_hiddens: List[torch.Tensor] = []  # for deep supervision (no detach)
@@ -475,14 +563,29 @@ class LLaDALoopedModel(LLaDAModel):
             h_next = h_out
             workspace_next = workspace
             if r > 0 and use_damped_update:
-                damping_alpha = self._feedback_alpha(r=r, T_rec=T_rec, ref=h)
-                h_next = h + damping_alpha * (h_out - h)
+                damping_alpha = self._feedback_alpha(
+                    r=r,
+                    T_rec=T_rec,
+                    ref=h,
+                    mask_ratio=diffusion_mask_ratio,
+                )
+                update_scale = damping_alpha
+                workspace_scale = damping_alpha
+                if update_scale.ndim == 1:
+                    update_scale = update_scale.view(B_, 1, 1)
+                    workspace_scale = update_scale
+                if diffusion_token_gate is not None:
+                    update_scale = update_scale * diffusion_token_gate
+                h_next = h + update_scale * (h_out - h)
                 if workspace is not None and workspace_out is not None:
-                    workspace_next = workspace + damping_alpha * (
+                    workspace_next = workspace + workspace_scale * (
                         workspace_out - workspace
                     )
                 if output_loop_diagnostics:
-                    diag_damping_alpha.append(damping_alpha.detach())
+                    diag_damping_alpha.append(damping_alpha.detach().mean())
+                    diag_damping_alpha_effective.append(
+                        update_scale.detach().mean()
+                    )
             elif workspace_out is not None:
                 workspace_next = workspace_out
 
@@ -550,17 +653,23 @@ class LLaDALoopedModel(LLaDAModel):
                     "raw_residual_norm": diag_raw_residual,
                     "adapter_update_norm": diag_adapter_update,
                     "damping_alpha": diag_damping_alpha,
+                    "damping_alpha_effective": diag_damping_alpha_effective,
                     "workspace_norm": diag_workspace_norm,
                     "workspace_update_norm": diag_workspace_update,
                     "T_rec": T_rec,
                     "use_damped_update": use_damped_update,
+                    "use_diffusion_conditioned_damping": (
+                        diffusion_conditioned_damping
+                    ),
                     "damping_schedule_id": {
                         "constant": 0.0,
                         "normalized": 1.0,
                         "decay": 2.0,
                     }.get(damping_schedule, -1.0),
                     "damping_tau": (
-                        self._damping_tau(h).detach()
+                        self._damping_tau(
+                            h, mask_ratio=diffusion_mask_ratio
+                        ).detach().mean()
                         if (
                             use_damped_update
                             and damping_schedule in {"normalized", "decay"}
@@ -572,6 +681,33 @@ class LLaDALoopedModel(LLaDAModel):
                     ),
                     "learn_damping_alpha": learn_damping_alpha,
                     "learn_damping_tau": learn_damping_tau,
+                    "mask_ratio": (
+                        diffusion_mask_ratio.detach().mean()
+                        if diffusion_mask_ratio is not None
+                        else None
+                    ),
+                    "damping_masked_gate": float(
+                        getattr(self.config, "damping_masked_gate", 1.0)
+                    ),
+                    "damping_unmasked_gate": float(
+                        getattr(self.config, "damping_unmasked_gate", 0.1)
+                    ),
+                    "mask_tau_ref": float(getattr(self.config, "mask_tau_ref", 0.5)),
+                    "mask_tau_slope": (
+                        self.mask_tau_slope.detach()
+                        if hasattr(self, "mask_tau_slope")
+                        else float(getattr(self.config, "mask_tau_slope_init", 0.0))
+                    ),
+                    "damping_alpha_sum": (
+                        torch.stack(diag_damping_alpha).sum()
+                        if diag_damping_alpha
+                        else None
+                    ),
+                    "damping_alpha_effective_sum": (
+                        torch.stack(diag_damping_alpha_effective).sum()
+                        if diag_damping_alpha_effective
+                        else None
+                    ),
                 }
                 if output_loop_diagnostics
                 else None
@@ -637,8 +773,10 @@ class LLaDALoopedModelLM(LLaDAModelLM):
                 (prelude_layers, recurrent_layers, coda_layers,
                  use_latent_feedback, mu_rec_eval, use_damped_update,
                  damping_schedule, damping_alpha, learn_damping_alpha,
-                 damping_tau, learn_damping_tau, damping_decay_beta, workspace_size,
-                 workspace_init_std).
+                 damping_tau, learn_damping_tau, damping_decay_beta,
+                 use_diffusion_conditioned_damping, damping_masked_gate,
+                 damping_unmasked_gate, learn_mask_tau, mask_tau_ref,
+                 mask_tau_slope_init, workspace_size, workspace_init_std).
         """
         from dllm.pipelines.llada.models.configuration_llada import LLaDAConfig
         from dllm.pipelines.llada.models.modeling_llada import LLaDAModelLM

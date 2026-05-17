@@ -9,7 +9,7 @@ Extends MDLMTrainer for the latent-feedback looped LLaDA:
   2. 1-step truncated BPTT inside the model.
 
   3. Loop-param LR multiplier (recursive_link.*, workspace_slots, plus
-     optional damping alpha/tau logits).
+     optional damping alpha/tau logits and diffusion-conditioned tau slope).
      10x is conservative; 50x is aggressive.
 
   4. Trainable-surface control. Default: freeze prelude + coda transformer
@@ -22,6 +22,7 @@ Extends MDLMTrainer for the latent-feedback looped LLaDA:
          loop/raw_residual_norm_iter{r} -- undamped proposal movement, if enabled
          loop/adapter_update_norm_iter{r}
          loop/damping_alpha_iter{r}
+         loop/damping_alpha_effective_iter{r}
      Use these to diagnose fixed-point convergence and adapter activity.
 
 Run:
@@ -89,11 +90,13 @@ _LOOP_PARAM_PREFIXES = (
     "model.recursive_link.",
     "model.damping_alpha_logit",
     "model.damping_tau_logit",
+    "model.mask_tau_slope",
     "model.workspace_slots",
 )
 _LOOP_NO_DECAY_PARAM_NAMES = {
     "model.damping_alpha_logit",
     "model.damping_tau_logit",
+    "model.mask_tau_slope",
     "model.workspace_slots",
 }
 
@@ -528,6 +531,7 @@ class MDLMLoopedTrainer(MDLMTrainer):
             "raw_residual_norm",
             "adapter_update_norm",
             "damping_alpha",
+            "damping_alpha_effective",
             "workspace_norm",
             "workspace_update_norm",
         ):
@@ -547,6 +551,14 @@ class MDLMLoopedTrainer(MDLMTrainer):
             "damping_decay_beta",
             "learn_damping_alpha",
             "learn_damping_tau",
+            "use_diffusion_conditioned_damping",
+            "mask_ratio",
+            "damping_masked_gate",
+            "damping_unmasked_gate",
+            "mask_tau_ref",
+            "mask_tau_slope",
+            "damping_alpha_sum",
+            "damping_alpha_effective_sum",
         ):
             value = diag.get(key, None)
             if value is None:

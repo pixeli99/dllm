@@ -97,6 +97,15 @@ class LoopArguments:
     damping_tau: float = 1.0
     learn_damping_tau: bool = True
     damping_decay_beta: float = 0.0
+    # ---- Diffusion-conditioned damping ----
+    # Keeps T_rec=1 unchanged, but for feedback passes lets tau depend on
+    # current mask ratio and gates updates on masked vs unmasked tokens.
+    use_diffusion_conditioned_damping: bool = False
+    damping_masked_gate: float = 1.0
+    damping_unmasked_gate: float = 0.1
+    learn_mask_tau: bool = True
+    mask_tau_ref: float = 0.5
+    mask_tau_slope_init: float = 0.0
     # ---- Feedback-only workspace slots ----
     # workspace_size=0 is the baseline. When >0, slots are appended only inside
     # feedback recurrent passes (r >= 1), so T_rec=1 keeps the vanilla path.
@@ -189,6 +198,14 @@ def train():
             damping_tau=loop_args.damping_tau,
             learn_damping_tau=loop_args.learn_damping_tau,
             damping_decay_beta=loop_args.damping_decay_beta,
+            use_diffusion_conditioned_damping=(
+                loop_args.use_diffusion_conditioned_damping
+            ),
+            damping_masked_gate=loop_args.damping_masked_gate,
+            damping_unmasked_gate=loop_args.damping_unmasked_gate,
+            learn_mask_tau=loop_args.learn_mask_tau,
+            mask_tau_ref=loop_args.mask_tau_ref,
+            mask_tau_slope_init=loop_args.mask_tau_slope_init,
             workspace_size=loop_args.workspace_size,
             workspace_init_std=loop_args.workspace_init_std,
         )
@@ -197,6 +214,10 @@ def train():
         )
 
     tokenizer = dllm.utils.get_tokenizer(model_args=model_args)
+    if getattr(tokenizer, "mask_token_id", None) is not None:
+        model.config.mask_token_id = int(tokenizer.mask_token_id)
+        if hasattr(model, "model"):
+            model.model.config.mask_token_id = int(tokenizer.mask_token_id)
 
     with accelerate.PartialState().local_main_process_first():
         dataset = dllm.data.load_sft_dataset(

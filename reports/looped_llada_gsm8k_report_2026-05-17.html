@@ -1,0 +1,491 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LLaDA 循环式 GSM8K 结果报告 - 2026-05-17</title>
+  <style>
+    :root {
+      --bg: #f6f2f7;
+      --paper: #ffffff;
+      --ink: #202124;
+      --muted: #62636a;
+      --line: #ded7e4;
+      --tsinghua: #660874;
+      --tsinghua-2: #8a5a96;
+      --green: #1f7a68;
+      --green-soft: #e7f3ef;
+      --purple-soft: #f0e7f3;
+      --gold: #b7791f;
+      --bad: #a23a3a;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background:
+        linear-gradient(180deg, #efe5f3 0, #f6f2f7 280px),
+        var(--bg);
+      color: var(--ink);
+      font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      max-width: 1240px;
+      margin: 0 auto;
+      padding: 34px 22px 56px;
+    }
+
+    header {
+      border-left: 6px solid var(--tsinghua);
+      padding: 4px 0 4px 18px;
+      margin-bottom: 22px;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 34px;
+      line-height: 1.15;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 0 0 12px;
+      font-size: 22px;
+      letter-spacing: 0;
+    }
+
+    h3 {
+      margin: 20px 0 8px;
+      font-size: 17px;
+      letter-spacing: 0;
+    }
+
+    p { margin: 7px 0; }
+    code {
+      padding: 2px 5px;
+      border-radius: 5px;
+      background: #f1edf3;
+      color: #3b2840;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12.5px;
+    }
+
+    .muted { color: var(--muted); }
+    .report-card {
+      background: rgba(255, 255, 255, 0.92);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 14px 36px rgba(38, 18, 43, 0.08);
+      overflow: hidden;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      background: var(--paper);
+    }
+
+    table {
+      width: 100%;
+      min-width: 1120px;
+      border-collapse: collapse;
+      background: var(--paper);
+    }
+
+    caption {
+      text-align: left;
+      padding: 16px 18px 10px;
+      color: var(--muted);
+      font-size: 13px;
+      background: var(--paper);
+    }
+
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 9px 10px;
+      text-align: right;
+      vertical-align: middle;
+      white-space: nowrap;
+    }
+
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      color: #4d3654;
+      font-size: 12px;
+      font-weight: 700;
+      background: #efe5f3;
+    }
+
+    td:first-child, th:first-child,
+    td:nth-child(2), th:nth-child(2) {
+      text-align: left;
+    }
+
+    tbody tr:nth-child(even) { background: #fbf9fc; }
+    tbody tr:hover { background: #f4edf7; }
+
+    .best-row {
+      background: var(--green-soft) !important;
+      box-shadow: inset 4px 0 0 var(--green);
+    }
+
+    .near-row {
+      box-shadow: inset 4px 0 0 var(--tsinghua-2);
+    }
+
+    .best {
+      color: var(--green);
+      font-weight: 800;
+    }
+
+    .weak { color: var(--bad); }
+    .dash { color: #9a8fa0; }
+
+    .tag {
+      display: inline-block;
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: var(--purple-soft);
+      color: var(--tsinghua);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin: 18px 0;
+    }
+
+    .summary-item {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 13px 14px;
+      background: rgba(255, 255, 255, 0.86);
+    }
+
+    .summary-label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+
+    .summary-value {
+      margin-top: 4px;
+      color: var(--tsinghua);
+      font-size: 25px;
+      font-weight: 800;
+      letter-spacing: 0;
+    }
+
+    .method-note {
+      margin: 18px 0;
+      padding: 15px 18px;
+      background: rgba(255, 255, 255, 0.9);
+      border: 1px solid var(--line);
+      border-left: 5px solid var(--tsinghua);
+      border-radius: 8px;
+    }
+
+    .method-note h2 {
+      margin-bottom: 8px;
+      font-size: 18px;
+    }
+
+    .method-note h3 {
+      margin: 16px 0 6px;
+      color: var(--tsinghua);
+    }
+
+    .formula {
+      margin: 10px 0;
+      padding: 12px 14px;
+      border-radius: 8px;
+      background: #f4edf7;
+      color: #35223b;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13px;
+      overflow-x: auto;
+      white-space: pre;
+    }
+
+    .method-note ul {
+      margin-top: 8px;
+    }
+
+    .findings {
+      margin-top: 20px;
+      padding: 20px 22px;
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    ol {
+      margin: 10px 0 0;
+      padding-left: 22px;
+    }
+
+    li { margin: 8px 0; }
+
+    .note {
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    @media (max-width: 900px) {
+      main { padding: 24px 14px 42px; }
+      h1 { font-size: 27px; }
+      .summary { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>LLaDA 循环式 GSM8K 结果报告</h1>
+    <p class="muted">更新时间：2026-05-17 HKT。评测任务为 <code>gsm8k_cot</code>，<code>limit=320</code>，主指标使用 Math-Verify；lm-eval flexible EM 只作为兼容参考。</p>
+  </header>
+
+  <section class="summary" aria-label="关键结论">
+    <div class="summary-item">
+      <div class="summary-label">当前最佳</div>
+      <div class="summary-value">85.31%</div>
+      <p class="muted">衰减调度 beta=0.5，T_rec=6，273 / 320。</p>
+    </div>
+    <div class="summary-item">
+      <div class="summary-label">相对强对照</div>
+      <div class="summary-value">+10 题</div>
+      <p class="muted">比无 workspace normalized 最佳结果 263 / 320 多答对 10 题。</p>
+    </div>
+    <div class="summary-item">
+      <div class="summary-label">主要信号</div>
+      <div class="summary-value">步长控制</div>
+      <p class="muted">收益主要来自前置衰减的更新预算，而不是 workspace。</p>
+    </div>
+  </section>
+
+  <section class="method-note">
+    <h2>实现说明</h2>
+    <h3>无 workspace 和 workspace 的区别</h3>
+    <p>
+      <strong>无 workspace</strong>：模型按 <code>Prelude -> R -> Coda</code> 走，第一遍 <code>R</code> 不经过
+      <code>RecursiveLink</code>，所以 <code>T_rec=1</code> 严格等价 vanilla split LLaDA；从第二遍开始用
+      <code>RecursiveLink(h)</code> 接回同一个中间块 <code>R</code>，再用 damping schedule 把 proposed hidden 和旧 hidden 插值。
+    </p>
+    <p>
+      <strong>Workspace</strong>：额外加入少量不可见 latent slots，只在 feedback iteration 里和 token hidden 拼接后送入 recurrent block。
+      Prelude、第一遍 <code>R</code>、Coda 和 LM head 仍只看 token hidden，因此 <code>T_rec=1</code> 仍保持 base 行为；workspace 的作用是给后续循环提供连续反馈状态，不直接输出 token。
+    </p>
+    <h3>Damping 在控制什么</h3>
+    <p>
+      递推里 <code>R(RecursiveLink(h))</code> 会给出一个新的 proposal hidden。没有 damping 时可以理解成直接用 proposal 替换旧 hidden，
+      等价于每个 feedback step 都走满一步；如果这个一步更新本来就是“一次性校正”，多走几次就容易 overshoot 或 hidden drift。
+      Damping 做的事很简单：只走 proposal 和旧 hidden 之间的一部分。
+    </p>
+    <div class="formula">h_1 = R(Prelude(x))
+for k = 1 ... K,  K = T_rec - 1:
+    proposed_k = R(RecursiveLink(h_k))
+    h_{k+1} = h_k + alpha_k * (proposed_k - h_k)</div>
+    <p>
+      这里 <code>alpha_k</code> 是每个 feedback step 的步长。<code>alpha_k=1</code> 表示走满 proposal；
+      <code>alpha_k=0.5</code> 表示只走一半。代码里最终会把 <code>alpha_k</code> clamp 到 <code>[0, 1]</code>，
+      workspace 版本也用同一个 <code>alpha_k</code> 去更新 workspace hidden。
+    </p>
+    <h3>三种 damping schedule</h3>
+    <ul>
+      <li><strong>constant</strong>：每一步都用同一个 <code>alpha</code>。这次的 alpha=0.5 结果说明它能缓解 overshoot，但本质只是把最佳点从 T=2 平移到 T=3；T=4 仍然开始过量更新。</li>
+      <li><strong>normalized</strong>：令 <code>K=T_rec-1</code>，每一步 <code>alpha_k=tau/K</code>。这样不同 T 的总更新预算大致都是 <code>tau</code>，T 越大只是把同一段 refinement path 切得更细。</li>
+      <li><strong>decay</strong>：总预算仍是 <code>tau</code>，但按 <code>softmax(-beta * k)</code> 分配到各步，所以前几步更大、后几步更小。<code>beta=0.5</code> 是温和前置，当前效果最好；<code>beta=1.0</code> 前置太强，后续 correction 不够。</li>
+    </ul>
+    <div class="formula">normalized: alpha_k = tau / K
+decay:      alpha_k = tau * softmax(-beta * [0, 1, ..., K-1])_k</div>
+    <p>
+      <code>tau</code> 是总 refinement budget。当前 normalized/decay 脚本默认让 <code>tau</code> 可学习：
+      模型里是正数参数 <code>model.damping_tau_logit</code> 经过 <code>softplus</code> 得到，并且在 stage1 optimizer 的 loop 参数组里更新。
+      所以这些实验不是冻结一个死的 tau，而是用 <code>tau=1.0</code> 作为初始化，让训练自己微调总步长预算。
+    </p>
+    <p>
+      现在结果的含义是：<code>constant alpha=0.5</code> 证明 overshoot/hidden drift 假设成立；
+      <code>normalized</code> 证明控制总预算是对的；<code>decay beta=0.5</code> 进一步说明“前面大修、后面小修”的分配更适合这个 loop。
+      所以当前最像贡献点的不是 workspace，而是 step-size controlled latent refinement。
+    </p>
+  </section>
+
+  <section class="report-card">
+    <div class="table-wrap">
+      <table>
+        <caption>
+          单表汇总所有已完成 GSM8K limit=320 结果。T 列为 Math-Verify 准确率，括号内为正确数；“lm-flex@最佳T”为同一最佳 T_rec 下的 lm-eval flexible EM。
+        </caption>
+        <thead>
+          <tr>
+            <th>实验</th>
+            <th>训练/调度设置</th>
+            <th>T1</th>
+            <th>T2</th>
+            <th>T3</th>
+            <th>T4</th>
+            <th>T5</th>
+            <th>T6</th>
+            <th>最佳 T</th>
+            <th>最佳 Math-Verify</th>
+            <th>lm-flex@最佳T</th>
+            <th>结论</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr class="best-row">
+            <td><span class="tag">当前最佳</span> 衰减调度 beta=0.5</td>
+            <td>无 workspace，可学习 tau，衰减调度</td>
+            <td>79.06% (253)</td>
+            <td>81.56% (261)</td>
+            <td>83.75% (268)</td>
+            <td>84.69% (271)</td>
+            <td>84.38% (270)</td>
+            <td class="best">85.31% (273)</td>
+            <td class="best">6</td>
+            <td class="best">85.31% / 273</td>
+            <td>0.7625</td>
+            <td>唯一形成明显 T-scaling 的设置。</td>
+          </tr>
+          <tr class="near-row">
+            <td>无 workspace normalized</td>
+            <td>可学习 tau，均匀 normalized damping</td>
+            <td>79.06% (253)</td>
+            <td class="best">82.19% (263)</td>
+            <td>79.38% (254)</td>
+            <td>79.69% (255)</td>
+            <td>80.94% (259)</td>
+            <td>79.69% (255)</td>
+            <td>2</td>
+            <td>82.19% / 263</td>
+            <td>0.7688</td>
+            <td>证明 total-budget control 有用，但曲线不稳定。</td>
+          </tr>
+          <tr>
+            <td>Workspace s8</td>
+            <td>仅反馈 workspace，8 个槽，normalized damping</td>
+            <td>79.06% (253)</td>
+            <td class="best">81.88% (262)</td>
+            <td class="best">81.88% (262)</td>
+            <td>79.06% (253)</td>
+            <td>78.44% (251)</td>
+            <td>79.06% (253)</td>
+            <td>2 / 3</td>
+            <td>81.88% / 262</td>
+            <td>0.7219 / 0.7344</td>
+            <td>最好的 workspace 变体，但仍未超过无 workspace 对照。</td>
+          </tr>
+          <tr>
+            <td>Workspace s16</td>
+            <td>仅反馈 workspace，16 个槽，normalized damping</td>
+            <td>79.06% (253)</td>
+            <td class="best">81.88% (262)</td>
+            <td>80.31% (257)</td>
+            <td>80.31% (257)</td>
+            <td>78.75% (252)</td>
+            <td>79.06% (253)</td>
+            <td>2</td>
+            <td>81.88% / 262</td>
+            <td>0.7156</td>
+            <td>接近 s8，但 T3/T4 稳定性更弱。</td>
+          </tr>
+          <tr>
+            <td>常量 damping alpha=0.5</td>
+            <td>无 workspace，固定 alpha=0.5</td>
+            <td>79.06% (253)</td>
+            <td>79.38% (254)</td>
+            <td class="best">81.56% (261)</td>
+            <td>78.44% (251)</td>
+            <td class="dash">-</td>
+            <td class="dash">-</td>
+            <td>3</td>
+            <td>81.56% / 261</td>
+            <td>0.6688</td>
+            <td>把最佳点从 T2 平移到 T3，仍会过量更新。</td>
+          </tr>
+          <tr>
+            <td>衰减调度 beta=1.0</td>
+            <td>无 workspace，可学习 tau，强衰减调度</td>
+            <td>79.06% (253)</td>
+            <td>78.44% (251)</td>
+            <td>80.31% (257)</td>
+            <td>80.00% (256)</td>
+            <td class="best">80.94% (259)</td>
+            <td>80.31% (257)</td>
+            <td>5</td>
+            <td>80.94% / 259</td>
+            <td>0.7469</td>
+            <td>衰减太激进，效果不如 beta=0.5。</td>
+          </tr>
+          <tr>
+            <td>Workspace s16，关闭深监督</td>
+            <td>16 个槽，normalized damping，无中间监督</td>
+            <td>79.06% (253)</td>
+            <td>77.81% (249)</td>
+            <td>80.00% (256)</td>
+            <td>79.06% (253)</td>
+            <td class="best">80.63% (258)</td>
+            <td>79.38% (254)</td>
+            <td>5</td>
+            <td>80.63% / 258</td>
+            <td>0.7344</td>
+            <td>去掉 deep supervision 有回升，但仍不强。</td>
+          </tr>
+          <tr>
+            <td>Workspace s32</td>
+            <td>仅反馈 workspace，32 个槽，normalized damping</td>
+            <td class="best">79.06% (253)</td>
+            <td class="weak">75.31% (241)</td>
+            <td>76.88% (246)</td>
+            <td>77.81% (249)</td>
+            <td>78.75% (252)</td>
+            <td>77.50% (248)</td>
+            <td>1</td>
+            <td>79.06% / 253</td>
+            <td>0.7781</td>
+            <td>workspace 过大明显伤害性能。</td>
+          </tr>
+          <tr>
+            <td>Workspace s16，lambda_deep=0.1</td>
+            <td>16 个槽，normalized damping，弱深监督</td>
+            <td class="best">79.06% (253)</td>
+            <td>76.25% (244)</td>
+            <td>77.19% (247)</td>
+            <td>78.75% (252)</td>
+            <td>77.50% (248)</td>
+            <td>76.56% (245)</td>
+            <td>1</td>
+            <td>79.06% / 253</td>
+            <td>0.7781</td>
+            <td>当前 deep supervision 配置是负信号。</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="findings">
+    <h2>发现</h2>
+    <ol>
+      <li><strong>最强信号是衰减式 step-size control。</strong> beta=0.5 从 T2 到 T6 基本持续上升，T6 达到 273 / 320，比此前最强的无 workspace normalized 对照多 10 题。</li>
+      <li><strong>常量 damping 只是平移最佳点。</strong> alpha=0.5 的最佳点在 T3，T4 又掉下去，说明它缓解了 overshoot，但没有让递推算子真正稳定。</li>
+      <li><strong>均匀 normalized damping 方向是对的，但还不够。</strong> 它保住了 T2 的强结果，但 T3-T6 没有形成干净增长；所以关键不是只固定总更新量，还要设计每一步怎么分配。</li>
+      <li><strong>workspace 目前不能作为主论点。</strong> s8/s16 接近强对照但没超过，s32 明显变差；当前数据更像注意力稀释或优化负担，而不是 workspace 带来稳定增益。</li>
+      <li><strong>深监督当前是负向或不确定。</strong> s16 的弱深监督结果最差，关闭后略回升；这说明中间监督的权重、位置或目标还没有调好。</li>
+      <li><strong>下一步优先级很明确。</strong> 先对 beta=0.5 跑完整 GSM8K，再做 beta=0.25/0.5/0.75 和 tau=0.75/1.0/1.25；同时把训练范围扩到 T_rec=2..6，并检查 <code>loop/damping_tau</code>、<code>loop/damping_alpha_iter*</code>、<code>loop/residual_norm_iter*</code>。</li>
+    </ol>
+    <p class="note">
+      当前最合适的研究表述是：预训练 diffusion LM 中存在可利用的 latent correction vector field，但反复应用它需要稳定的 integration schedule；温和前置衰减的 step size 能把额外 loop depth 转化为有效 refinement，而不是 hidden drift。
+    </p>
+  </section>
+</main>
+</body>
+</html>

@@ -64,6 +64,17 @@ class LLaDALoopedConfig(LLaDAConfig):
         damping_tau: float = 1.0,
         learn_damping_tau: bool = True,
         damping_decay_beta: float = 0.0,
+        # ---- Diffusion-conditioned damping ----
+        # Optional DLM-specific controller for normalized/decay damping.
+        # It keeps the same closed-loop fixed-point update, but lets the
+        # total budget depend on current mask ratio and gates token updates
+        # by whether the token is masked. Disabled by default.
+        use_diffusion_conditioned_damping: bool = False,
+        damping_masked_gate: float = 1.0,
+        damping_unmasked_gate: float = 0.1,
+        learn_mask_tau: bool = True,
+        mask_tau_ref: float = 0.5,
+        mask_tau_slope_init: float = 0.0,
         # ---- Feedback-only workspace slots ----
         # When workspace_size > 0, learnable continuous slots are appended only
         # during feedback recurrent passes (r >= 1). Prelude, first R pass, coda,
@@ -95,6 +106,14 @@ class LLaDALoopedConfig(LLaDAConfig):
         self.damping_tau = float(damping_tau)
         self.learn_damping_tau = bool(learn_damping_tau)
         self.damping_decay_beta = float(damping_decay_beta)
+        self.use_diffusion_conditioned_damping = bool(
+            use_diffusion_conditioned_damping
+        )
+        self.damping_masked_gate = float(damping_masked_gate)
+        self.damping_unmasked_gate = float(damping_unmasked_gate)
+        self.learn_mask_tau = bool(learn_mask_tau)
+        self.mask_tau_ref = float(mask_tau_ref)
+        self.mask_tau_slope_init = float(mask_tau_slope_init)
         valid_schedules = {"constant", "normalized", "decay"}
         if self.damping_schedule not in valid_schedules:
             raise ValueError(
@@ -111,6 +130,23 @@ class LLaDALoopedConfig(LLaDAConfig):
             raise ValueError(
                 f"damping_decay_beta must be >= 0, got {self.damping_decay_beta}"
             )
+        if not 0.0 <= self.damping_unmasked_gate <= 1.0:
+            raise ValueError(
+                "damping_unmasked_gate must be in [0, 1], "
+                f"got {self.damping_unmasked_gate}"
+            )
+        if not 0.0 <= self.damping_masked_gate <= 1.0:
+            raise ValueError(
+                "damping_masked_gate must be in [0, 1], "
+                f"got {self.damping_masked_gate}"
+            )
+        if self.damping_masked_gate < self.damping_unmasked_gate:
+            raise ValueError(
+                "damping_masked_gate should be >= damping_unmasked_gate "
+                "so masked tokens receive at least as much refinement."
+            )
+        if not 0.0 <= self.mask_tau_ref <= 1.0:
+            raise ValueError(f"mask_tau_ref must be in [0, 1], got {self.mask_tau_ref}")
         if self.learn_damping_alpha and self.damping_schedule != "constant":
             raise ValueError(
                 "learn_damping_alpha is only supported for constant damping_schedule"
